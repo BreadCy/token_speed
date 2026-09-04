@@ -1,6 +1,6 @@
 [package]
 name = "tokenspeed"
-version = "0.5.9"
+version = "0.5.10"
 edition = "2021"
 description = "AI coding speed monitor (tokens/s) — ZCode / Codex / OpenCode / Claude Code"
 build = "build.rs"

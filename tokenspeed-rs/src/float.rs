@@ -207,7 +207,10 @@ unsafe fn runs_width(hwnd: HWND, st: &FloatState, runs: &[Run]) -> i32 {
     total
 }
 
-unsafe fn draw_runs(hdc: HWND, st: &FloatState, runs: &[Run], x0: i32, baseline: i32) {
+/// 逐段绘制一行；ref_font 是该行主字体，其视觉盒决定行中心，
+/// 每个 run 相对行中心垂直居中（行内小字/标签不再贴基线下坠）
+unsafe fn draw_runs(hdc: HWND, st: &FloatState, runs: &[Run], x0: i32, baseline: i32, ref_font: usize) {
+    let center = baseline - st.ascent[ref_font] + st.cell[ref_font] / 2;
     let mut x = x0;
     for r in runs {
         SelectObject(hdc, st.fonts[r.font]);
@@ -217,7 +220,7 @@ unsafe fn draw_runs(hdc: HWND, st: &FloatState, runs: &[Run], x0: i32, baseline:
         let wide: Vec<u16> = r.text.encode_utf16().collect();
         let mut size = SIZE { cx: 0, cy: 0 };
         GetTextExtentPoint32W(hdc, wide.as_ptr(), wide.len() as i32, &mut size);
-        TextOutW(hdc, x, baseline - tm.tmAscent, wide.as_ptr(), wide.len() as i32);
+        TextOutW(hdc, x, center - tm.tmHeight / 2, wide.as_ptr(), wide.len() as i32);
         x += size.cx;
     }
 }
@@ -296,9 +299,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let base2 = PAD_T + state.cell[F_BIG] + GAP + state.ascent[F_SMALL];
                 // 同字体行的基线间距 = 行高 + 行距
                 let base3 = base2 + state.cell[F_SMALL] + GAP;
-                draw_runs(mem, state, &line1_runs(&state.snap), STRIP_W + PAD_L, base1);
-                draw_runs(mem, state, &line2_runs(&state.snap), STRIP_W + PAD_L, base2);
-                draw_runs(mem, state, &line3_runs(&state.snap), STRIP_W + PAD_L, base3);
+                draw_runs(mem, state, &line1_runs(&state.snap), STRIP_W + PAD_L, base1, F_BIG);
+                draw_runs(mem, state, &line2_runs(&state.snap), STRIP_W + PAD_L, base2, F_SMALL);
+                draw_runs(mem, state, &line3_runs(&state.snap), STRIP_W + PAD_L, base3, F_SMALL);
             } else {
                 SelectObject(mem, state.fonts[F_MAIN]);
                 SetTextColor(mem, TXT_DIM);
