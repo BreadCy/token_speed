@@ -1,0 +1,21 @@
+{
+  "name": "tokenspeed",
+  "version": "0.2.0",
+  "description": "Show model generation speed (tokens/s) across ZCode, Codex, OpenCode and Claude Code: unified stats, float bar, watch mode.",
+  "description_i18n": {
+    "zh-CN": "显示 ZCode/Codex/OpenCode/Claude Code 的模型生成速度（tokens/s）：/tokenspeed 命令按需查询各工具最近请求、ZCode 会话汇总与明细；另提供零会话占用的置顶悬浮条与终端 watch 模式。"
+  },
+  "author": { "name": "czh" },
+  "license": "MIT",
+  "commands": "commands",
+  "skills": "skills",
+  "hooks": "hooks",
+  "userConfig": {
+    "auto_report": {
+      "type": "boolean",
+      "default": true,
+      "title": "每轮自动上报速度",
+      "description": "每次回复结束后通过 Stop hook 自动注入本轮生成速度（tokens/s）。关闭后仍可随时用 /tokenspeed 查询。"
+    }
+  }
+}

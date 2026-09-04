@@ -1,0 +1,8 @@
+# Rust 构建产物
+tokenspeed-rs/target/
+
+# 部署用的二进制（由 target/release 复制，不进版本库）
+tokenspeed/bin/*.exe
+
+# ZCode 会话/计划数据
+.zcode/

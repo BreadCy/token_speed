@@ -1,0 +1,16 @@
+{
+  "name": "zcode-plugin-local",
+  "plugins": [
+    {
+      "name": "tokenspeed",
+      "source": "./tokenspeed",
+      "version": "0.2.0",
+      "description": "Show model generation speed (tokens/s) across ZCode, Codex, OpenCode and Claude Code.",
+      "description_i18n": {
+        "zh-CN": "显示 ZCode/Codex/OpenCode/Claude Code 的模型生成速度（tokens/s）统计。"
+      },
+      "author": { "name": "czh" },
+      "keywords": ["tokens", "speed", "stats", "hook"]
+    }
+  ]
+}

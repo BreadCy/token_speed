@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "${ZCODE_PLUGIN_ROOT}/bin/tokenspeed.exe",
+            "args": [
+              "--hook",
+              "--auto-report=${user_config.auto_report}"
+            ],
+            "timeoutMs": 10000,
+            "statusMessage": "统计本轮生成速度 (tokens/s)"
+          }
+        ]
+      }
+    ]
+  }
+}
