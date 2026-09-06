@@ -88,37 +88,38 @@ fn configure_fonts(ctx: &egui::Context) {
 }
 
 fn configure_style(ctx: &egui::Context) {
-    const BG: egui::Color32 = egui::Color32::from_rgb(247, 246, 243);
-    const TEXT: egui::Color32 = egui::Color32::from_rgb(23, 23, 23);
-    const MUTED: egui::Color32 = egui::Color32::from_rgb(119, 115, 108);
-    const LINE: egui::Color32 = egui::Color32::from_rgb(231, 229, 224);
-    const ACCENT: egui::Color32 = egui::Color32::from_rgb(46, 125, 91);
+    const BG: egui::Color32 = egui::Color32::from_rgb(29, 30, 32);
+    const SURFACE: egui::Color32 = egui::Color32::from_rgb(36, 37, 41);
+    const TEXT: egui::Color32 = egui::Color32::from_rgb(235, 235, 238);
+    const MUTED: egui::Color32 = egui::Color32::from_rgb(157, 157, 164);
+    const LINE: egui::Color32 = egui::Color32::from_rgb(53, 54, 60);
+    const ACCENT: egui::Color32 = egui::Color32::from_rgb(93, 190, 126);
 
-    ctx.set_visuals(egui::Visuals::light());
+    ctx.set_visuals(egui::Visuals::dark());
     ctx.style_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.window_margin = egui::Margin::same(16);
+        style.spacing.item_spacing = egui::vec2(8.0, 5.0);
+        style.spacing.window_margin = egui::Margin::same(14);
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
         style.visuals.override_text_color = Some(TEXT);
         style.visuals.weak_text_color = Some(MUTED);
         style.visuals.panel_fill = BG;
-        style.visuals.window_fill = egui::Color32::WHITE;
+        style.visuals.window_fill = SURFACE;
         style.visuals.window_stroke = egui::Stroke::new(1.0, LINE);
         style.visuals.window_corner_radius = egui::CornerRadius::same(10);
         style.visuals.window_shadow = egui::Shadow::NONE;
         style.visuals.hyperlink_color = ACCENT;
-        style.visuals.warn_fg_color = egui::Color32::from_rgb(155, 103, 32);
+        style.visuals.warn_fg_color = egui::Color32::from_rgb(220, 188, 112);
         style.visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
         style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, LINE);
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
+        style.visuals.widgets.inactive.bg_fill = SURFACE;
         style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, LINE);
-        style.visuals.widgets.hovered.bg_fill = BG;
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(47, 48, 53);
         style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, MUTED);
-        style.visuals.widgets.active.bg_fill = BG;
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(47, 48, 53);
         style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, TEXT);
-        style.visuals.widgets.open.bg_fill = BG;
+        style.visuals.widgets.open.bg_fill = egui::Color32::from_rgb(47, 48, 53);
         style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, TEXT);
-        style.visuals.button_frame = false;
+        style.visuals.button_frame = true;
         style.visuals.collapsing_header_frame = false;
     });
 }
@@ -127,8 +128,8 @@ pub fn run() -> Result<(), String> {
     let config = Config::load().map_err(|error| error.to_string())?;
     let viewport = egui::ViewportBuilder::default()
         .with_title("TokenSpeed")
-        .with_inner_size([420.0, 240.0])
-        .with_min_inner_size([360.0, 180.0])
+        .with_inner_size([420.0, 300.0])
+        .with_min_inner_size([380.0, 240.0])
         .with_always_on_top();
     let options = eframe::NativeOptions {
         viewport,
@@ -313,10 +314,14 @@ impl eframe::App for TokenSpeedApp {
         self.drain_updates();
         ctx.request_repaint_after(Duration::from_millis(250));
 
-        const TEXT: egui::Color32 = egui::Color32::from_rgb(23, 23, 23);
-        const MUTED: egui::Color32 = egui::Color32::from_rgb(119, 115, 108);
-        const GREEN: egui::Color32 = egui::Color32::from_rgb(46, 125, 91);
-        const AMBER: egui::Color32 = egui::Color32::from_rgb(155, 103, 32);
+        const SURFACE: egui::Color32 = egui::Color32::from_rgb(36, 37, 41);
+        const LIST_BG: egui::Color32 = egui::Color32::from_rgb(25, 26, 29);
+        const TEXT: egui::Color32 = egui::Color32::from_rgb(235, 235, 238);
+        const MUTED: egui::Color32 = egui::Color32::from_rgb(157, 157, 164);
+        const LINE: egui::Color32 = egui::Color32::from_rgb(53, 54, 60);
+        const GREEN: egui::Color32 = egui::Color32::from_rgb(93, 190, 126);
+        const GREEN_SOFT: egui::Color32 = egui::Color32::from_rgba_premultiplied(46, 95, 63, 90);
+        const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 188, 112);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -325,11 +330,16 @@ impl eframe::App for TokenSpeedApp {
                 ui.label(
                     egui::RichText::new(Self::agent_label(self.config.selected_agent))
                         .size(14.0)
-                        .strong(),
+                        .color(TEXT),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("设置").size(12.0)).frame(false))
+                        .add(
+                            egui::Button::new(egui::RichText::new("设置").size(11.0).color(MUTED))
+                                .fill(SURFACE)
+                                .stroke(egui::Stroke::new(1.0, LINE))
+                                .corner_radius(egui::CornerRadius::same(6)),
+                        )
                         .clicked()
                     {
                         self.show_settings = true;
@@ -352,106 +362,149 @@ impl eframe::App for TokenSpeedApp {
                 );
                 ui.label(egui::RichText::new("tok/s").size(16.0).color(MUTED));
                 if let Some(turn) = turn {
+                    let accuracy_color = match turn.accuracy {
+                        Accuracy::Exact => GREEN,
+                        Accuracy::Estimated => AMBER,
+                        Accuracy::Unavailable => MUTED,
+                    };
                     ui.label(
                         egui::RichText::new(Self::accuracy_label(turn.accuracy))
-                            .size(12.0)
-                            .color(GREEN),
+                            .size(11.0)
+                            .color(accuracy_color),
                     );
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let live = self
+                        .report
+                        .as_ref()
+                        .is_some_and(|report| !report.turns.is_empty());
+                    let fill = if live { GREEN_SOFT } else { SURFACE };
+                    let color = if live { GREEN } else { MUTED };
+                    egui::Frame::new()
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, LINE))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(if live { "LIVE" } else { "IDLE" })
+                                    .size(10.0)
+                                    .strong()
+                                    .color(color),
+                            );
+                        });
+                });
             });
 
             if self.report.as_ref().is_some_and(|report| report.running) {
                 ui.horizontal(|ui| {
                     Self::status_dot(ui, AMBER);
-                    ui.small("生成中 · 保留上一完整轮结果");
+                    ui.label(egui::RichText::new("生成中").size(11.0).color(AMBER));
+                    ui.label(
+                        egui::RichText::new("· 保留上一完整结果")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
                 });
             }
 
-            ui.add_space(8.0);
-            ui.separator();
             if let Some(report) = &self.report {
-                egui::Grid::new("summary")
-                    .num_columns(2)
-                    .spacing(egui::vec2(18.0, 5.0))
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .stroke(egui::Stroke::new(1.0, LINE))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("模型").size(11.0).color(MUTED));
-                        ui.label(
-                            egui::RichText::new(
-                                report
-                                    .turns
-                                    .first()
-                                    .and_then(|turn| turn.model.as_deref())
-                                    .unwrap_or("未提供"),
-                            )
-                            .size(12.0),
-                        );
-                        ui.end_row();
-
-                        ui.label(egui::RichText::new("最近一轮").size(11.0).color(MUTED));
-                        ui.label(
-                            egui::RichText::new(report.turns.first().map_or_else(
-                                || "—".into(),
-                                |turn| {
-                                    format!(
-                                        "{} tok · {:.3} tok/s",
-                                        turn.output_tokens, turn.effective_speed
-                                    )
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("模型速度 · 会话加权平均")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format_session_average(
+                                            report.session_total_tokens,
+                                            report.session_total_elapsed_ms,
+                                            report.session_accuracy,
+                                        ))
+                                        .size(11.0)
+                                        .family(egui::FontFamily::Monospace)
+                                        .color(TEXT),
+                                    );
                                 },
-                            ))
-                            .size(12.0)
-                            .family(egui::FontFamily::Monospace),
-                        );
-                        ui.end_row();
-
-                        ui.label(egui::RichText::new("会话平均").size(11.0).color(MUTED));
-                        ui.label(
-                            egui::RichText::new(format_session_average(
-                                report.session_total_tokens,
-                                report.session_total_elapsed_ms,
-                                report.session_accuracy,
-                            ))
-                            .size(12.0)
-                            .family(egui::FontFamily::Monospace),
-                        );
-                        ui.end_row();
-                    });
-
-                egui::CollapsingHeader::new(egui::RichText::new("最近 10 轮").size(12.0))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(96.0)
+                            );
+                        });
+                        ui.add_space(8.0);
+                        egui::Frame::new()
+                            .fill(LIST_BG)
+                            .stroke(egui::Stroke::new(1.0, LINE))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(0))
                             .show(ui, |ui| {
-                                for turn in &report.turns {
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(&turn.turn_id)
-                                                .size(11.0)
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("▾ 最近 10 轮").size(11.0).color(MUTED),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} 轮 · 每轮自动更新",
+                                                    report.turns.len()
+                                                ))
+                                                .size(10.0)
                                                 .color(MUTED),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
+                                            );
+                                        },
+                                    );
+                                });
+                                ui.separator();
+                                egui::ScrollArea::vertical()
+                                    .max_height(116.0)
+                                    .show(ui, |ui| {
+                                        for turn in &report.turns {
+                                            ui.horizontal(|ui| {
+                                                let id = turn
+                                                    .turn_id
+                                                    .chars()
+                                                    .take(20)
+                                                    .collect::<String>();
                                                 ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{} tok · {:.3} tok/s · {}",
-                                                        turn.output_tokens,
-                                                        turn.effective_speed,
-                                                        Self::accuracy_label(turn.accuracy)
-                                                    ))
-                                                    .size(11.0)
-                                                    .family(egui::FontFamily::Monospace),
+                                                    egui::RichText::new(format!("{}…", id))
+                                                        .size(10.0)
+                                                        .color(TEXT),
                                                 );
-                                            },
-                                        );
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "{} tok · {:.3} tok/s · {}",
+                                                                turn.output_tokens,
+                                                                turn.effective_speed,
+                                                                Self::accuracy_label(turn.accuracy)
+                                                            ))
+                                                            .size(10.0)
+                                                            .family(egui::FontFamily::Monospace)
+                                                            .color(MUTED),
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                            ui.separator();
+                                        }
                                     });
-                                    ui.separator();
-                                }
                             });
                     });
             }
 
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.separator();
             ui.label(egui::RichText::new(&self.status).size(11.0).color(MUTED));
         });
