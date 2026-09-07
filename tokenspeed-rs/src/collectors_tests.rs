@@ -486,3 +486,66 @@ fn claude_sorts_files_and_deduplicates_per_session_after_active_confirmation() {
     assert!(!by_session.contains_key("sess-no-ts"));
     assert!(!root.exists() || fs::remove_dir_all(&root).is_ok());
 }
+
+#[test]
+fn zcode_running_requires_fresh_tool_row_or_recent_activity() {
+    use super::collectors::{session_running, ZCODE_ACTIVE_WINDOW_MS, ZCODE_TOOL_STALE_MS};
+    let con = Connection::open_in_memory().unwrap();
+    con.execute_batch(
+        "CREATE TABLE tool_usage (session_id TEXT, status TEXT, started_at INTEGER);",
+    )
+    .unwrap();
+    let now = 1_000_000_000_i64;
+
+    // No rows at all: only recent activity keeps the session running.
+    assert!(!session_running(
+        &con,
+        "s1",
+        now,
+        now - ZCODE_ACTIVE_WINDOW_MS - 1_000
+    ));
+    assert!(session_running(
+        &con,
+        "s1",
+        now,
+        now - ZCODE_ACTIVE_WINDOW_MS / 2
+    ));
+
+    // A fresh running tool row runs the session even without recent model rows.
+    con.execute(
+        "INSERT INTO tool_usage VALUES ('s1', 'running', ?1)",
+        params![now - 1_000],
+    )
+    .unwrap();
+    assert!(session_running(&con, "s1", now, 0));
+    // ...but only for its own session.
+    assert!(!session_running(&con, "s2", now, 0));
+
+    // A tool row stuck at "running" by a crashed CLI goes stale.
+    con.execute("DELETE FROM tool_usage", []).unwrap();
+    con.execute(
+        "INSERT INTO tool_usage VALUES ('s1', 'running', ?1)",
+        params![now - ZCODE_TOOL_STALE_MS - 1_000],
+    )
+    .unwrap();
+    assert!(!session_running(&con, "s1", now, 0));
+
+    // Completed tool rows never count as running.
+    con.execute("DELETE FROM tool_usage", []).unwrap();
+    con.execute(
+        "INSERT INTO tool_usage VALUES ('s1', 'completed', ?1)",
+        params![now],
+    )
+    .unwrap();
+    assert!(!session_running(&con, "s1", now, 0));
+}
+
+#[test]
+fn zcode_running_tolerates_missing_tool_usage_table() {
+    use super::collectors::session_running;
+    // Old DB schemas may lack tool_usage: freshness must keep working.
+    let con = Connection::open_in_memory().unwrap();
+    let now = 1_000_000_000_i64;
+    assert!(session_running(&con, "s1", now, now - 10_000));
+    assert!(!session_running(&con, "s1", now, 0));
+}

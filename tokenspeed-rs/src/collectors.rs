@@ -3,7 +3,7 @@
 //! Parsers intentionally return completed turns only. Message bodies are never
 //! inspected beyond the metadata needed to identify a turn.
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -367,6 +367,39 @@ pub fn collect_zcode_with_running(con: &Connection) -> Result<Vec<Snapshot>, Sou
     collect_zcode_impl(con, true)
 }
 
+/// Freshness window bridging turn boundaries (segment end -> tool run -> next
+/// segment). The longest pure-stream segment observed is ~80s; 60s bridges all
+/// but the tail of those while keeping the post-turn halo short-lived.
+pub(crate) const ZCODE_ACTIVE_WINDOW_MS: i64 = 60_000;
+/// A tool_usage row stuck at "running" by a crashed CLI must not keep the
+/// session alive forever; older rows are treated as stale.
+pub(crate) const ZCODE_TOOL_STALE_MS: i64 = 30 * 60_000;
+
+pub(crate) fn session_running(
+    con: &Connection,
+    session_id: &str,
+    now: i64,
+    activity_at: i64,
+) -> bool {
+    // tool_usage may be absent in older DB schemas; fall back to freshness only.
+    let tool_running = con
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_usage
+             WHERE session_id = ?1 AND status = 'running' AND started_at >= ?2)",
+            params![session_id, now - ZCODE_TOOL_STALE_MS],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    tool_running || now.saturating_sub(activity_at) <= ZCODE_ACTIVE_WINDOW_MS
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn collect_zcode_impl(
     con: &Connection,
     include_running: bool,
@@ -448,7 +481,16 @@ fn collect_zcode_impl(
             .entry(turn.session.id.clone())
             .or_insert_with(|| (turn.session.clone(), turn.completed_at, false));
         state.1 = state.1.max(turn.completed_at);
-        state.2 |= turn.has_incomplete_sibling;
+    }
+    // ZCode commits only at request/tool boundaries: nothing is observable in
+    // the DB while a response is mid-stream (verified by polling the live DB
+    // during active generation). "Running" therefore means a tool call is
+    // executing right now, or a model row landed recently enough that turn
+    // boundaries keep arriving. Stale non-completed rows (cancelled/error from
+    // long-dead turns) no longer count as running.
+    let now = current_unix_ms();
+    for state in states.values_mut() {
+        state.2 = session_running(con, &state.0.id, now, state.1);
     }
     let turns = grouped
         .into_values()
