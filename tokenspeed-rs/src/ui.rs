@@ -534,6 +534,7 @@ impl TokenSpeedApp {
             Agent::Codex => "Codex",
             Agent::OpenCode => "OpenCode",
             Agent::ClaudeCode => "Claude Code",
+            Agent::Pi => "Pi",
         }
     }
 

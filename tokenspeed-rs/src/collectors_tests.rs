@@ -1,6 +1,8 @@
 use super::collectors::{
-    collect_claude, collect_codex, collect_codex_with_running, collect_opencode, collect_zcode,
-    collect_zcode_with_running, Accuracy, Agent, SourceError,
+    collect_claude, collect_codex, collect_codex_with_running, collect_opencode, collect_pi,
+    collect_pi_files_with_running, collect_pi_with_running, collect_zcode,
+    collect_zcode_with_running, pi_turn_running, Accuracy, Agent, SourceError,
+    PI_ACTIVE_WINDOW_MS,
 };
 use rusqlite::{params, Connection};
 use std::fs;
@@ -430,7 +432,9 @@ fn incomplete_codex_and_zcode_sessions_are_reported_as_running() {
         .iter()
         .find(|snapshot| snapshot.session.id == "sess-z-1")
         .unwrap();
-    assert!(active.running);
+    // Since 81c2555 zcode running requires a fresh tool row or recent activity;
+    // this fixture's epoch-era timestamps are stale, so it must not be running.
+    assert!(!active.running);
     assert_eq!(active.activity_at, 13_000);
 }
 
@@ -548,4 +552,69 @@ fn zcode_running_tolerates_missing_tool_usage_table() {
     let now = 1_000_000_000_i64;
     assert!(session_running(&con, "s1", now, now - 10_000));
     assert!(!session_running(&con, "s1", now, 0));
+}
+
+#[test]
+fn pi_aggregates_completed_turn_and_skips_error_rows() {
+    let snapshots = collect_pi(&fixture("pi.jsonl")).unwrap();
+    assert_eq!(snapshots.len(), 1);
+    let snapshot = &snapshots[0];
+    assert_eq!(snapshot.agent, Agent::Pi);
+    assert_eq!(snapshot.session.id, "sess-pi-1");
+    assert_eq!(snapshot.session.project.as_deref(), Some("/work/pi-project"));
+    // The open second turn is not a completed turn and stays unmeasured.
+    assert_eq!(snapshot.turns.len(), 1);
+    let turn = &snapshot.turns[0];
+    // Error row contributes nothing; toolUse + stop rows sum to 100.
+    assert_eq!(turn.output_tokens, 100);
+    assert_eq!(turn.started_at, 1_759_996_800_000);
+    assert_eq!(turn.completed_at, 1_759_996_803_000);
+    assert!((turn.effective_speed - 100.0 / 3.0).abs() < 0.01);
+    assert_eq!(turn.accuracy, Accuracy::Estimated);
+    assert_eq!(turn.model.as_deref(), Some("muse-spark-1.2"));
+    assert_eq!(turn.model_accuracy, Accuracy::Unavailable);
+    assert_eq!(snapshot.session_total_tokens, 100);
+    assert!(!snapshot.running);
+}
+
+#[test]
+fn pi_running_requires_fresh_activity() {
+    // The fixture's timestamps are in the past, so its open turn must never
+    // look running under the real clock (static fixture × time-window rule).
+    let result = collect_pi_files_with_running(&[fixture("pi.jsonl")]).unwrap();
+    let snapshot = result
+        .iter()
+        .find(|snapshot| snapshot.session.id == "sess-pi-1")
+        .unwrap();
+    assert!(!snapshot.running);
+    assert_eq!(snapshot.turns.len(), 1);
+}
+
+#[test]
+fn pi_running_window_is_inclusive_and_gated_by_controlled_clock() {
+    let now = 1_760_000_010_000_i64;
+    assert!(pi_turn_running(now, now));
+    assert!(pi_turn_running(now, now - PI_ACTIVE_WINDOW_MS));
+    assert!(!pi_turn_running(now, now - PI_ACTIVE_WINDOW_MS - 1));
+    assert!(!pi_turn_running(now, 0));
+}
+
+#[test]
+fn pi_with_running_never_marks_stale_sessions() {
+    // collect_pi_with_running shares the collector with the engine; the stale
+    // fixture must not leak a "running" session through this path either.
+    let result = collect_pi_with_running(&fixture("pi.jsonl")).unwrap();
+    assert!(result.iter().all(|snapshot| !snapshot.running));
+}
+
+#[test]
+fn pi_rejects_files_without_session_header() {
+    let path = std::env::temp_dir().join("tokenspeed-pi-no-header.jsonl");
+    fs::write(
+        &path,
+        "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"timestamp\":1}}\n",
+    )
+    .unwrap();
+    let error = collect_pi(&path).unwrap_err();
+    assert!(matches!(error, SourceError::UnknownSchema(_)));
 }

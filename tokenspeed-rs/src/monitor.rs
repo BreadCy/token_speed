@@ -1,6 +1,7 @@
 use crate::collectors::{
     collect_claude_with_running, collect_codex_with_running, collect_opencode_with_running,
-    collect_zcode_with_running, Accuracy, Agent, Snapshot, TurnMeasurement,
+    collect_pi_with_running, collect_zcode_with_running, Accuracy, Agent, Snapshot,
+    TurnMeasurement,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OpenFlags};
@@ -26,6 +27,8 @@ pub enum SourceKind {
     OpenCodeDb,
     #[serde(rename = "claude-code")]
     ClaudeProjects,
+    #[serde(rename = "pi")]
+    PiSessions,
 }
 
 impl SourceKind {
@@ -35,6 +38,7 @@ impl SourceKind {
             Self::CodexSessions => "codex",
             Self::OpenCodeDb => "opencode",
             Self::ClaudeProjects => "claude-code",
+            Self::PiSessions => "pi",
         }
     }
 
@@ -44,6 +48,7 @@ impl SourceKind {
             Self::CodexSessions => Agent::Codex,
             Self::OpenCodeDb => Agent::OpenCode,
             Self::ClaudeProjects => Agent::ClaudeCode,
+            Self::PiSessions => Agent::Pi,
         }
     }
 }
@@ -172,6 +177,28 @@ fn explicit_source_candidates(agent: Agent) -> Vec<(String, SourceLocation)> {
                 ));
             }
         }
+        Agent::Pi => {
+            // pi resolves its session dir as PI_CODING_AGENT_SESSION_DIR, else
+            // PI_CODING_AGENT_DIR/sessions, else ~/.pi/agent/sessions (config.js).
+            if let Some(root) = std::env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+                candidates.push((
+                    "PI_CODING_AGENT_SESSION_DIR".into(),
+                    SourceLocation {
+                        kind: SourceKind::PiSessions,
+                        path: PathBuf::from(root),
+                    },
+                ));
+            }
+            if let Some(root) = std::env::var_os("PI_CODING_AGENT_DIR") {
+                candidates.push((
+                    "PI_CODING_AGENT_DIR".into(),
+                    SourceLocation {
+                        kind: SourceKind::PiSessions,
+                        path: PathBuf::from(root).join("sessions"),
+                    },
+                ));
+            }
+        }
     }
     candidates
 }
@@ -183,6 +210,7 @@ fn default_source_candidates(agent: Agent) -> Vec<SourceLocation> {
         Agent::Codex => home_path(&[".codex", "sessions"]),
         Agent::OpenCode => home_path(&[".local", "share", "opencode", "opencode.db"]),
         Agent::ClaudeCode => home_path(&[".claude", "projects"]),
+        Agent::Pi => home_path(&[".pi", "agent", "sessions"]),
     };
     if let Some(path) = path {
         candidates.push(SourceLocation {
@@ -191,6 +219,7 @@ fn default_source_candidates(agent: Agent) -> Vec<SourceLocation> {
                 Agent::Codex => SourceKind::CodexSessions,
                 Agent::OpenCode => SourceKind::OpenCodeDb,
                 Agent::ClaudeCode => SourceKind::ClaudeProjects,
+                Agent::Pi => SourceKind::PiSessions,
             },
             path,
         });
@@ -236,7 +265,7 @@ pub fn detect_source(agent: Agent) -> Result<Option<SourceLocation>, MonitorErro
                     )));
                 }
             }
-            SourceKind::CodexSessions | SourceKind::ClaudeProjects => {
+            SourceKind::CodexSessions | SourceKind::ClaudeProjects | SourceKind::PiSessions => {
                 if !candidate.path.is_dir() {
                     return Err(MonitorError::Source(format!(
                         "{env_name} points to missing or unreadable source directory: {}",
@@ -258,7 +287,9 @@ pub fn detect_source(agent: Agent) -> Result<Option<SourceLocation>, MonitorErro
             SourceKind::ZCodeDb | SourceKind::OpenCodeDb => {
                 candidate.path.is_file() && sqlite_header(&candidate.path).unwrap_or(false)
             }
-            SourceKind::CodexSessions | SourceKind::ClaudeProjects => candidate.path.is_dir(),
+            SourceKind::CodexSessions | SourceKind::ClaudeProjects | SourceKind::PiSessions => {
+                candidate.path.is_dir()
+            }
         };
         if valid {
             return Ok(Some(candidate));
@@ -278,6 +309,7 @@ pub fn detect_all_installed() -> Vec<SourceLocation> {
         Agent::Codex,
         Agent::OpenCode,
         Agent::ClaudeCode,
+        Agent::Pi,
     ] {
         let explicit = explicit_source_candidates(agent);
         let candidate = match explicit.into_iter().next() {
@@ -291,7 +323,9 @@ pub fn detect_all_installed() -> Vec<SourceLocation> {
             SourceKind::ZCodeDb | SourceKind::OpenCodeDb => {
                 candidate.path.is_file() && sqlite_header(&candidate.path).unwrap_or(false)
             }
-            SourceKind::CodexSessions | SourceKind::ClaudeProjects => candidate.path.is_dir(),
+            SourceKind::CodexSessions | SourceKind::ClaudeProjects | SourceKind::PiSessions => {
+                candidate.path.is_dir()
+            }
         };
         if valid {
             found.push(candidate);
@@ -575,6 +609,8 @@ pub(crate) fn snapshots_for(source: &SourceLocation) -> Result<Vec<Snapshot>, Mo
         ),
         SourceKind::ClaudeProjects => collect_claude_with_running(&source.path)
             .map_err(|e| MonitorError::Source(e.to_string())),
+        SourceKind::PiSessions => collect_pi_with_running(&source.path)
+            .map_err(|e| MonitorError::Source(e.to_string())),
     }
 }
 
@@ -596,6 +632,14 @@ fn snapshots_for_selector(
                 return Ok(Vec::new());
             }
             crate::collectors::collect_claude_files_with_running(&files)
+                .map_err(|e| MonitorError::Source(e.to_string()))
+        }
+        SourceKind::PiSessions => {
+            let files = selected_jsonl_files(source, selector)?;
+            if files.is_empty() {
+                return Ok(Vec::new());
+            }
+            crate::collectors::collect_pi_files_with_running(&files)
                 .map_err(|e| MonitorError::Source(e.to_string()))
         }
         _ => snapshots_for(source),
@@ -627,7 +671,7 @@ pub(crate) fn is_relevant_change(
                             .unwrap_or("db")
                     ))
         }
-        SourceKind::CodexSessions | SourceKind::ClaudeProjects => {
+        SourceKind::CodexSessions | SourceKind::ClaudeProjects | SourceKind::PiSessions => {
             changed.is_dir() || changed.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
         }
     }
@@ -755,6 +799,7 @@ fn collect_statuses(project: Option<&str>, sources: &[SourceLocation]) -> Vec<Ag
         Agent::Codex,
         Agent::OpenCode,
         Agent::ClaudeCode,
+        Agent::Pi,
     ]
     .into_iter()
     .map(

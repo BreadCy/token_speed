@@ -2,6 +2,7 @@
 
 ## 架构决策
 
+- **Pi agent 接入**（2026-09-07）：数据源 `~/.pi/agent/sessions/`（按项目分目录的会话 JSONL），env 优先级 `PI_CODING_AGENT_SESSION_DIR` > `PI_CODING_AGENT_DIR/sessions` > 默认路径（与 pi 的 config.js 一致，Windows 同用 home 目录）。会话头 entry（`type:"session"`）带 id+cwd；assistant 信封 `timestamp` = 写入（完成）时间、`message.timestamp` = 请求开始时间。turn 语义：user 开轮、`stopReason:"stop"` 收轮；**`error`/`aborted` 行不 poison、保持 open**（pi 同 turn 内重试继续累计），未收轮被下一轮 user 直接取代、永不计量。**running 判定加 5 分钟新鲜度窗口（`PI_ACTIVE_WINDOW_MS`）**：语料实测 26/146 会话以 error 收尾、17 个停在 toolUse（中途崩溃），open turn 若无窗口会永久挂起"生成中"；不用 ZCode 的 60s 是因为 pi 对长工具执行期间零可见性（entry 只在请求/工具完成时落盘），60s 会让正常构建/测试期间光环熄灭。无首 token 时间戳 → model_speed 恒为无可靠区间（与 Codex/OpenCode/Claude 一致）。
 - **聚合监控引擎**（2026-09-06 重设计检测逻辑）：`monitor.rs` 的 `spawn_engine(project)` 单线程管理全部已装 agent 源——每源一个 notify watcher（事件携带 agent 标记）、30s reconcile 全量重检测（新装/卸载自动出现）。对外只发 `EngineEvent::Statuses(Vec<AgentStatus>)`，UI **永不因切 agent 重启线程**（切 tab = 纯 UI 选择；只有改项目固定才 `restart_engine`）。
 - **事件只重扫"脏" agent**：watcher 事件进 dirty 集，防抖后只重扫对应源；全量重扫真实大库（Claude projects 可达数百 MB）一次要几十 ms，事件驱动全量重扫会让 UI 更新退化到秒级——这是探针实测出的教训。
 - **跟随模式** `config.follow_mode: manual|auto`（默认 manual，serde default 向后兼容）：auto 规则 = 当前对象生成中则保持、否则跟随最近活跃的生成中 agent、全部空闲停在最近活跃（不回跳默认）；**自动档中手动点 tab = 切回 manual 并锁定**（显式操作，不违背「永不静默切换」）。切模式不重启引擎，下一帧 drain 自动重选。
@@ -24,6 +25,8 @@
 - **混合 CJK+数字的文本慎用 monospace 家族**：Menlo 数字 x 高度小、字距宽，与回退 CJK 字体（占满 em 框）同排观感"忽大忽小"；表头/标签类文本用 proportional（CJK 在栈首，拉丁字形来自同一字体），纯数字表格列才保留 monospace。
 
 ## 踩坑与约束（长期有效）
+- **手写 fixture 的毫秒时间戳必须与 ISO 信封时间换算一致**（2026-09-07）：pi fixture 初版把 1760000000000 当成 2025-10-09T08:00:00Z（实际是 08:53:20Z），导致 completed < started，turn 被「完成必须晚于开始」守卫正确拒绝，表现为莫名的 `NoCompletedTurn`。教训：造带双格式时间戳的 fixture 先用 `date -r <ms>` 核对换算，守卫拒绝时先怀疑数据自洽性而不是解析器。
+- **时间窗口型判定 × 静态时间戳 fixture**（2026-09-07）：`81c2555` 把 ZCode running 判定改为「新鲜 tool_usage 行或 60s 内活跃」后，`incomplete_codex_and_zcode_sessions_are_reported_as_running` 的 fixture 仍是纪元附近时间戳（13_000ms），用真实时钟算 `now - activity_at` 恒大于窗口 → `running=false`，断言必然失败（非环境抖动）。教训：改时间窗口类逻辑必须审计「静态 fixture × 真实时钟」的测试，fixture 永远进不了 recency 窗口时把断言翻转到新语义并注释 commit 号；窗口语义本身用受控时钟的专属测试钉死（如 `zcode_running_requires_fresh_tool_row_or_recent_activity`）。pi 的 `pi_running_window_is_inclusive_and_gated_by_controlled_clock` 沿用同一做法。
 - **"四个圆角不一样"排查结论（2026-09-06）**：窗口本体截图（`screencapture -l <windowid>` 带 alpha）实测四个极端角 alpha 全为 0——四角圆弧绘制始终一致（HUD_RADIUS 10）。"下角像直角"是**对比度错觉**：桌面底部是暗色，深色卡片 + 近隐形描边（LINE #2A2C30）让下角圆弧融进背景。修复 = 窗口描边专用更亮的 `WINDOW_EDGE #3C3F46`（仅 hud_frame 用，分隔线仍 LINE）。**教训：透明 HUD 判断圆角/直角必须读窗口 alpha 通道而非屏幕截图——背景色会污染颜色过滤，背后窗口的灰（如 IDE #2B2B2B）会冒充卡片色，曾把排查引向"内容绘制越界"的错误方向近一小时。**
 
 - egui 0.32 没有假粗体（epaint 明确 TODO）：`.strong()` 不改变字重，粗体必须加载真实字面。Menlo.ttc 索引 0=Regular、1=Bold；Hiragino Sans GB.ttc 索引 0=W3、2=W6。大号数字注册自定义字族 `tsnum` = [menlo-bold, system-cjk]。

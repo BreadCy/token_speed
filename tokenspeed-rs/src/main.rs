@@ -105,6 +105,7 @@ fn parse_agent(value: &str) -> Agent {
         "codex" | "cx" => Agent::Codex,
         "opencode" | "oc" => Agent::OpenCode,
         "claude" | "claude-code" | "cc" => Agent::ClaudeCode,
+        "pi" => Agent::Pi,
         _ => usage_error("unknown agent"),
     }
 }
@@ -403,11 +404,12 @@ fn _report_type_is_serializable(_: &FollowerReport) {}
 // and its Stop hook runs `tokenspeed --hook --auto-report=...`. These flags
 // predate the subcommand CLI and must keep working across installs.
 
-const LEGACY_AGENTS: [Agent; 4] = [
+const LEGACY_AGENTS: [Agent; 5] = [
     Agent::ZCode,
     Agent::Codex,
     Agent::OpenCode,
     Agent::ClaudeCode,
+    Agent::Pi,
 ];
 const LEGACY_FALSY: [&str; 3] = ["0", "false", "off"];
 
@@ -417,6 +419,7 @@ fn legacy_tag(agent: Agent) -> &'static str {
         Agent::Codex => "CX",
         Agent::OpenCode => "OC",
         Agent::ClaudeCode => "CC",
+        Agent::Pi => "PI",
     }
 }
 
@@ -426,6 +429,7 @@ fn legacy_name(agent: Agent) -> &'static str {
         Agent::Codex => "Codex",
         Agent::OpenCode => "OpenCode",
         Agent::ClaudeCode => "Claude Code",
+        Agent::Pi => "Pi",
     }
 }
 

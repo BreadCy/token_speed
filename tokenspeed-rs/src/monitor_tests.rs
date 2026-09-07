@@ -1,7 +1,7 @@
 use super::collectors::Agent;
 use super::monitor::{
-    detect_all_installed, is_relevant_change, path_matches, run_engine, snapshots_for, EngineEvent,
-    EngineOptions, Selector, SourceKind, SourceLocation,
+    detect_all_installed, is_relevant_change, path_matches, run_engine, scan_once, snapshots_for,
+    EngineEvent, EngineOptions, Selector, SourceKind, SourceLocation,
 };
 use std::fs;
 use std::path::Path;
@@ -57,9 +57,14 @@ fn unc_path_matching_normalizes_extended_unc_prefix() {
 fn source_kind_is_stable_for_sqlite_and_jsonl_sources() {
     assert_eq!(SourceKind::ZCodeDb.as_str(), "zcode");
     assert_eq!(SourceKind::ClaudeProjects.as_str(), "claude-code");
+    assert_eq!(SourceKind::PiSessions.as_str(), "pi");
     assert_eq!(
         serde_json::to_string(&SourceKind::CodexSessions).unwrap(),
         "\"codex\""
+    );
+    assert_eq!(
+        serde_json::to_string(&SourceKind::PiSessions).unwrap(),
+        "\"pi\""
     );
 }
 
@@ -118,13 +123,21 @@ fn engine_options(max_runtime: Duration) -> EngineOptions {
 /// Pin every agent env var to a missing location so only the fixture under test is
 /// detected — otherwise the engine would pick up this machine's real agent data.
 fn isolate_agent_env(root: &Path) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
-    let saved = ["ZCODE_HOME", "XDG_DATA_HOME", "CLAUDE_CONFIG_DIR"]
-        .iter()
-        .map(|name| (*name, std::env::var_os(name)))
-        .collect();
+    let saved = [
+        "ZCODE_HOME",
+        "XDG_DATA_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+    ]
+    .iter()
+    .map(|name| (*name, std::env::var_os(name)))
+    .collect();
     std::env::set_var("ZCODE_HOME", root.join("none/zcode"));
     std::env::set_var("XDG_DATA_HOME", root.join("none/xdg"));
     std::env::set_var("CLAUDE_CONFIG_DIR", root.join("none/claude"));
+    std::env::set_var("PI_CODING_AGENT_DIR", root.join("none/pi"));
+    std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
     saved
 }
 
@@ -314,15 +327,21 @@ fn detect_all_installed_reports_every_agent_independently() {
     }
     // Claude：projects 目录
     fs::create_dir_all(root.join("claude/projects")).unwrap();
+    // Pi：agent/sessions 目录（PI_CODING_AGENT_DIR 语义，与 pi 的 config.js 一致）
+    fs::create_dir_all(root.join("pi/agent/sessions")).unwrap();
 
     let old_zcode = std::env::var_os("ZCODE_HOME");
     let old_codex = std::env::var_os("CODEX_HOME");
     let old_xdg = std::env::var_os("XDG_DATA_HOME");
     let old_claude = std::env::var_os("CLAUDE_CONFIG_DIR");
+    let old_pi_dir = std::env::var_os("PI_CODING_AGENT_DIR");
+    let old_pi_sessions = std::env::var_os("PI_CODING_AGENT_SESSION_DIR");
     std::env::set_var("ZCODE_HOME", root.join("zcode"));
     std::env::set_var("CODEX_HOME", root.join("codex"));
     std::env::set_var("XDG_DATA_HOME", root.join("xdg"));
     std::env::set_var("CLAUDE_CONFIG_DIR", root.join("claude"));
+    std::env::set_var("PI_CODING_AGENT_DIR", root.join("pi/agent"));
+    std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
     // XDG 指向的 opencode 数据库不存在：该 agent 保持未安装，也不回退污染结果
     let found = detect_all_installed();
     let kinds: Vec<SourceKind> = found.iter().map(|source| source.kind).collect();
@@ -331,7 +350,8 @@ fn detect_all_installed_reports_every_agent_independently() {
         vec![
             SourceKind::ZCodeDb,
             SourceKind::CodexSessions,
-            SourceKind::ClaudeProjects
+            SourceKind::ClaudeProjects,
+            SourceKind::PiSessions
         ]
     );
 
@@ -357,6 +377,60 @@ fn detect_all_installed_reports_every_agent_independently() {
     match old_claude {
         Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
         None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+    }
+    match old_pi_dir {
+        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+    }
+    match old_pi_sessions {
+        Some(value) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", value),
+        None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pi_sessions_source_is_detected_and_scanned() {
+    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "tokenspeed-pi-scan-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sessions = root.join("agent/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("2025-10-09T08-00-00-000Z_sess-pi-1.jsonl"),
+        fs::read_to_string(fixture("pi.jsonl")).unwrap(),
+    )
+    .unwrap();
+    let old_dir = std::env::var_os("PI_CODING_AGENT_DIR");
+    let old_sessions = std::env::var_os("PI_CODING_AGENT_SESSION_DIR");
+    std::env::set_var("PI_CODING_AGENT_DIR", root.join("agent"));
+    std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+    let report = scan_once(&Selector {
+        agent: Agent::Pi,
+        project: None,
+        session: None,
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.agent, Agent::Pi);
+    assert_eq!(report.session, "sess-pi-1");
+    assert_eq!(report.project.as_deref(), Some("/work/pi-project"));
+    assert_eq!(report.turns.len(), 1);
+    assert_eq!(report.turns[0].output_tokens, 100);
+    // Fixture timestamps are stale relative to the real clock: never running.
+    assert!(!report.running);
+    match old_dir {
+        Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
+        None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+    }
+    match old_sessions {
+        Some(value) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", value),
+        None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
     }
     fs::remove_dir_all(root).unwrap();
 }

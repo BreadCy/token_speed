@@ -1,4 +1,4 @@
-//! Portable, read-only metadata collectors for the four supported agents.
+//! Portable, read-only metadata collectors for the five supported agents.
 //!
 //! Parsers intentionally return completed turns only. Message bodies are never
 //! inspected beyond the metadata needed to identify a turn.
@@ -22,6 +22,8 @@ pub enum Agent {
     OpenCode,
     #[serde(rename = "claude-code")]
     ClaudeCode,
+    #[serde(rename = "pi")]
+    Pi,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +41,7 @@ impl Agent {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::ClaudeCode => "claude-code",
+            Self::Pi => "pi",
         }
     }
 }
@@ -1163,6 +1166,240 @@ fn collect_claude_paths(
             } else {
                 result.push(Snapshot {
                     agent: Agent::ClaudeCode,
+                    session,
+                    turns: Vec::new(),
+                    all_turns: Vec::new(),
+                    session_total_tokens: 0,
+                    session_total_elapsed_ms: 0,
+                    session_accuracy: Accuracy::Unavailable,
+                    activity_at,
+                    running: true,
+                });
+            }
+        }
+    }
+    if result.is_empty() {
+        Err(SourceError::NoCompletedTurn)
+    } else {
+        Ok(result)
+    }
+}
+
+// ---- Pi (pi-coding-agent) ----
+
+#[derive(Deserialize)]
+struct PiEntry {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    id: Option<String>,
+    timestamp: Option<Timestamp>,
+    cwd: Option<String>,
+    message: Option<PiMessage>,
+}
+
+#[derive(Deserialize)]
+struct PiMessage {
+    role: Option<String>,
+    #[serde(rename = "stopReason")]
+    stop_reason: Option<String>,
+    model: Option<String>,
+    /// Request start time (unix ms); the envelope timestamp marks the write.
+    timestamp: Option<i64>,
+    usage: Option<PiUsage>,
+}
+
+#[derive(Deserialize)]
+struct PiUsage {
+    output: Option<i64>,
+}
+
+struct PiTurn {
+    session: SessionRef,
+    started_at: i64,
+    completed_at: i64,
+    output: u64,
+    models: Vec<Option<String>>,
+    malformed: bool,
+}
+
+/// An open turn stops counting as "running" once its entries go stale. Pi only
+/// appends entries when a request or tool call completes — nothing is observable
+/// while a long tool runs — and 18% of recorded sessions end in an error state
+/// (pi gave up retrying) with the turn left open. A 60s window like ZCode's
+/// would drop the running indicator during ordinary builds/tests; 5 minutes
+/// covers those while dead sessions still stop glowing quickly enough.
+pub(crate) const PI_ACTIVE_WINDOW_MS: i64 = 5 * 60_000;
+
+pub(crate) fn pi_turn_running(now: i64, activity_at: i64) -> bool {
+    now.saturating_sub(activity_at) <= PI_ACTIVE_WINDOW_MS
+}
+
+/// Read completed Pi turns; a turn closes only on `stopReason = "stop"`.
+/// `error`/`aborted` rows keep the turn open (pi retries within the same turn),
+/// and an unfinished turn is simply superseded — never measured — when the next
+/// user message arrives.
+pub fn collect_pi(path: &Path) -> Result<Vec<Snapshot>, SourceError> {
+    collect_pi_impl(path, false)
+}
+
+pub fn collect_pi_with_running(path: &Path) -> Result<Vec<Snapshot>, SourceError> {
+    collect_pi_impl(path, true)
+}
+
+pub(crate) fn collect_pi_files_with_running(
+    files: &[PathBuf],
+) -> Result<Vec<Snapshot>, SourceError> {
+    collect_pi_paths(files.to_vec(), true, current_unix_ms())
+}
+
+fn collect_pi_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot>, SourceError> {
+    let files = claude_files(path)?;
+    collect_pi_paths(files, include_running, current_unix_ms())
+}
+
+fn collect_pi_paths(
+    files: Vec<PathBuf>,
+    include_running: bool,
+    now: i64,
+) -> Result<Vec<Snapshot>, SourceError> {
+    if files.is_empty() {
+        return Err(SourceError::UnknownSchema("no JSONL files".into()));
+    }
+    // Session file names sort by start timestamp, so name order yields
+    // chronological turns across a project's session files.
+    let mut files = files;
+    files.sort();
+    let mut active: HashMap<String, PiTurn> = HashMap::new();
+    let mut last_activity: HashMap<String, i64> = HashMap::new();
+    let mut malformed_sessions = HashSet::new();
+    let mut saw_header = false;
+    let mut turns = Vec::new();
+    for file in files {
+        // Session identity comes from each file's `session` header entry.
+        let mut current: Option<SessionRef> = None;
+        for parsed in parse_json_stream::<PiEntry>(&file)? {
+            let Ok(entry) = parsed else {
+                // A corrupt line poisons the file's session, same as Claude.
+                if let Some(sid) = current.as_ref().map(|session| session.id.clone()) {
+                    malformed_sessions.insert(sid.clone());
+                    if let Some(turn) = active.get_mut(&sid) {
+                        turn.malformed = true;
+                    }
+                }
+                continue;
+            };
+            if entry.kind.as_deref() == Some("session") {
+                saw_header = true;
+                if let Some(id) = entry.id.clone() {
+                    current = Some(session(id, entry.cwd.clone()));
+                }
+                continue;
+            }
+            if entry.kind.as_deref() != Some("message") {
+                continue;
+            }
+            let Some(message) = entry.message.as_ref() else {
+                continue;
+            };
+            let Some(current_session) = current.as_ref() else {
+                continue;
+            };
+            let sid = current_session.id.clone();
+            let envelope_ts = entry.timestamp.as_ref().and_then(unix_ms);
+            let stamp = message.timestamp.or(envelope_ts);
+            if let Some(stamp) = stamp {
+                let latest = last_activity.get(&sid).copied().unwrap_or(0).max(stamp);
+                last_activity.insert(sid.clone(), latest);
+            }
+            match message.role.as_deref() {
+                Some("user") => {
+                    let Some(started_at) = stamp else { continue };
+                    active.insert(
+                        sid.clone(),
+                        PiTurn {
+                            session: current_session.clone(),
+                            started_at,
+                            completed_at: envelope_ts.unwrap_or(started_at),
+                            output: 0,
+                            models: Vec::new(),
+                            malformed: false,
+                        },
+                    );
+                }
+                Some("assistant") => {
+                    let Some(turn) = active.get_mut(&sid) else {
+                        continue;
+                    };
+                    if let Some(completed) = envelope_ts {
+                        turn.completed_at = turn.completed_at.max(completed);
+                    }
+                    let output = message
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.output)
+                        .unwrap_or(0);
+                    turn.output = turn.output.saturating_add(output.max(0) as u64);
+                    turn.models.push(message.model.clone());
+                    if message.stop_reason.as_deref() == Some("stop") {
+                        if let Some(done) = active.remove(&sid) {
+                            if !done.malformed
+                                && done.output > 0
+                                && done.completed_at > done.started_at
+                            {
+                                turns.push(TurnMeasurement {
+                                    turn_id: format!("{}:{}", done.session.id, done.started_at),
+                                    session: done.session,
+                                    output_tokens: done.output,
+                                    started_at: done.started_at,
+                                    completed_at: done.completed_at,
+                                    effective_speed: speed(
+                                        done.output,
+                                        done.started_at,
+                                        done.completed_at,
+                                    ),
+                                    accuracy: Accuracy::Estimated,
+                                    model: model_name(done.models),
+                                    model_speed: None,
+                                    model_accuracy: Accuracy::Unavailable,
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !saw_header && turns.is_empty() {
+        return Err(SourceError::UnknownSchema("missing session header".into()));
+    }
+    turns.retain(|turn| !malformed_sessions.contains(&turn.session.id));
+    // Open turns are potentially still generating; freshness gates dead ones.
+    let active_state = active
+        .into_values()
+        .filter(|turn| !turn.malformed)
+        .map(|turn| {
+            let activity = turn
+                .completed_at
+                .max(last_activity.get(&turn.session.id).copied().unwrap_or(0));
+            (turn.session, activity)
+        })
+        .collect::<Vec<_>>();
+    let mut result = snapshots(Agent::Pi, turns).unwrap_or_default();
+    if include_running {
+        for (session, activity_at) in active_state {
+            if !pi_turn_running(now, activity_at) {
+                continue;
+            }
+            if let Some(snapshot) = result
+                .iter_mut()
+                .find(|snapshot| snapshot.session.id == session.id)
+            {
+                snapshot.running = true;
+                snapshot.activity_at = snapshot.activity_at.max(activity_at);
+            } else {
+                result.push(Snapshot {
+                    agent: Agent::Pi,
                     session,
                     turns: Vec::new(),
                     all_turns: Vec::new(),
