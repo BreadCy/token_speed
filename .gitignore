@@ -6,3 +6,7 @@ tokenspeed/bin/*.exe
 
 # ZCode 会话/计划数据
 .zcode/
+
+# 构建产物
+_dist_artifacts/
+dist/
