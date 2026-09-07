@@ -1,7 +1,8 @@
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::exit;
 
-use tokenspeed::collectors::{Accuracy, Agent};
+use tokenspeed::collectors::{Accuracy, Agent, TurnMeasurement};
 use tokenspeed::config::{normalize_project, Config};
 use tokenspeed::monitor::{
     detect_source, run_engine, scan_once, EngineEvent, EngineOptions, FollowerReport, Selector,
@@ -11,6 +12,29 @@ use tokenspeed::ui;
 fn usage_error(message: &str) -> ! {
     eprintln!("{message}");
     exit(2);
+}
+
+/// The desktop HUD must not stay attached to the launching console: closing a
+/// console window on Windows terminates every process attached to it, which
+/// killed the HUD as soon as users dismissed the console that double-click
+/// opened. CLI subcommands keep their console and stdout untouched.
+#[cfg(windows)]
+fn detach_console() {
+    // Failure is fine: the process may have no console to detach from.
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+fn detach_console() {}
+
+fn run_desktop() {
+    detach_console();
+    if let Err(error) = ui::run() {
+        eprintln!("desktop UI error: {error}");
+        exit(2);
+    }
 }
 
 #[cfg(test)]
@@ -30,6 +54,49 @@ fn human_speed_includes_accuracy_label() {
 #[test]
 fn missing_model_speed_is_an_em_dash() {
     assert_eq!(format_model_speed(None, Accuracy::Unavailable), "—");
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_secs_truncates_minutes_without_rolling_over() {
+    assert_eq!(legacy_secs(0), "0.0s");
+    assert_eq!(legacy_secs(59_400), "59.4s");
+    // 119.96s must truncate to 1m59s, never round into "1m60s".
+    assert_eq!(legacy_secs(119_960), "1m59s");
+    assert_eq!(legacy_secs(90_500), "1m30s");
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_thousands_groups_by_three() {
+    assert_eq!(legacy_thousands(0), "0");
+    assert_eq!(legacy_thousands(999), "999");
+    assert_eq!(legacy_thousands(1_000), "1,000");
+    assert_eq!(legacy_thousands(40_284), "40,284");
+    assert_eq!(legacy_thousands(-1_234_567), "-1,234,567");
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_speed_prefers_model_speed_and_marks_estimates() {
+    use tokenspeed::collectors::SessionRef;
+    let turn = |model_speed| TurnMeasurement {
+        turn_id: "t".into(),
+        session: SessionRef {
+            id: "s".into(),
+            project: None,
+        },
+        output_tokens: 100,
+        started_at: 0,
+        completed_at: 1_000,
+        effective_speed: 50.0,
+        accuracy: Accuracy::Estimated,
+        model: None,
+        model_speed,
+        model_accuracy: Accuracy::Unavailable,
+    };
+    assert_eq!(legacy_speed(&turn(Some(80.0))), (80.0, false));
+    assert_eq!(legacy_speed(&turn(None)), (50.0, true));
 }
 
 fn parse_agent(value: &str) -> Agent {
@@ -195,11 +262,28 @@ fn main() {
         return;
     }
     if first.is_none() {
-        if let Err(error) = ui::run() {
-            eprintln!("desktop UI error: {error}");
-            exit(2);
-        }
+        run_desktop();
         return;
+    }
+    // Legacy plugin CLI surface (v0.5.9): the ZCode plugin's skill and Stop
+    // hook invoke `tokenspeed --limit N [--tool zc|cx|oc|cc]` and
+    // `tokenspeed --hook --auto-report=...`. Route those flags before the
+    // subcommand/`report` parsing claims them.
+    if let Some(value) = first.as_deref() {
+        let name = value.split('=').next().unwrap_or_default();
+        if matches!(
+            name,
+            "--hook"
+                | "--limit"
+                | "--tool"
+                | "--report"
+                | "--bench"
+                | "--db"
+                | "--auto-report"
+                | "--autostart"
+        ) {
+            exit(legacy_cli(std::iter::once(value.to_string()).chain(args)));
+        }
     }
     let report_alias = first
         .as_deref()
@@ -219,10 +303,7 @@ fn main() {
             if args.next().is_some() {
                 usage_error("ui does not accept arguments");
             }
-            if let Err(error) = ui::run() {
-                eprintln!("desktop UI error: {error}");
-                exit(2);
-            }
+            run_desktop();
         }
         "config" => exit(config_command(args)),
         "watch" => {
@@ -316,3 +397,268 @@ fn main() {
 
 #[allow(dead_code)]
 fn _report_type_is_serializable(_: &FollowerReport) {}
+
+// ---------- Legacy plugin CLI (v0.5.9 compatible) ----------
+// The ZCode plugin's skill runs `tokenspeed --limit N [--tool zc|cx|oc|cc]`
+// and its Stop hook runs `tokenspeed --hook --auto-report=...`. These flags
+// predate the subcommand CLI and must keep working across installs.
+
+const LEGACY_AGENTS: [Agent; 4] = [
+    Agent::ZCode,
+    Agent::Codex,
+    Agent::OpenCode,
+    Agent::ClaudeCode,
+];
+const LEGACY_FALSY: [&str; 3] = ["0", "false", "off"];
+
+fn legacy_tag(agent: Agent) -> &'static str {
+    match agent {
+        Agent::ZCode => "ZC",
+        Agent::Codex => "CX",
+        Agent::OpenCode => "OC",
+        Agent::ClaudeCode => "CC",
+    }
+}
+
+fn legacy_name(agent: Agent) -> &'static str {
+    match agent {
+        Agent::ZCode => "ZCode",
+        Agent::Codex => "Codex",
+        Agent::OpenCode => "OpenCode",
+        Agent::ClaudeCode => "Claude Code",
+    }
+}
+
+fn legacy_secs(ms: i64) -> String {
+    let s = ms as f64 / 1000.0;
+    if s < 60.0 {
+        format!("{s:.1}s")
+    } else {
+        // Truncate, never round: rounding would print "1m60s" at s = 119.96.
+        format!("{}m{}s", (s / 60.0) as i64, (s % 60.0) as i64)
+    }
+}
+
+fn legacy_ts(epoch_ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(epoch_ms)
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| "-".into())
+}
+
+fn legacy_thousands(n: i64) -> String {
+    let s = n.abs().to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    if n < 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// Best available speed for a legacy row: pure-generation model speed when
+/// reliable, otherwise the whole-turn estimate (marked with `~`).
+fn legacy_speed(turn: &TurnMeasurement) -> (f64, bool) {
+    turn.model_speed
+        .map(|speed| (speed, false))
+        .unwrap_or((turn.effective_speed, true))
+}
+
+fn legacy_latest_line(agent: Agent, turn: &TurnMeasurement) -> String {
+    let (speed, estimated) = legacy_speed(turn);
+    let model = turn.model.as_deref().unwrap_or("-");
+    format!(
+        "[{}] {} {} {}{speed:.1} tok/s | {} tokens / {}",
+        legacy_tag(agent),
+        legacy_ts(turn.completed_at),
+        model,
+        if estimated { "~" } else { "" },
+        legacy_thousands(turn.output_tokens as i64),
+        legacy_secs(turn.completed_at.saturating_sub(turn.started_at)),
+    )
+}
+
+fn legacy_report_for(agent: Agent, session: Option<String>) -> Option<FollowerReport> {
+    detect_source(agent).ok().flatten()?;
+    scan_once(&Selector {
+        agent,
+        project: None,
+        session,
+    })
+    .ok()
+    .flatten()
+}
+
+fn legacy_cli(mut args: impl Iterator<Item = String>) -> i32 {
+    let mut limit = 10usize;
+    let mut tool = None;
+    let mut session = None;
+    let mut hook = false;
+    let mut auto_report = "true".to_string();
+    while let Some(arg) = args.next() {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name.to_string(), Some(value.to_string())),
+            None => (arg.clone(), None),
+        };
+        let mut value = || inline.clone().or_else(|| args.next());
+        match name.as_str() {
+            "--hook" => hook = true,
+            "--report" | "--bench" => {}
+            "--limit" => limit = value().and_then(|v| v.parse().ok()).unwrap_or(10),
+            "--tool" => tool = value(),
+            "--session" => session = value(),
+            "--auto-report" => auto_report = value().unwrap_or_default(),
+            // Accepted for compatibility; the new build derives paths itself.
+            "--db" | "--autostart" => {
+                let _ = value();
+            }
+            _ => {}
+        }
+    }
+    if hook {
+        legacy_hook(&auto_report, session);
+        return 0;
+    }
+    let agents: Vec<Agent> = match tool.as_deref() {
+        Some(value) => vec![parse_agent(value)],
+        None => LEGACY_AGENTS.to_vec(),
+    };
+    legacy_report(&agents, limit.max(1))
+}
+
+/// Stop-hook mode: print one `{"additionalContext": ...}` line for the freshest
+/// ZCode turn. Every failure path returns silently — a hook must never block
+/// the conversation.
+fn legacy_hook(auto_report: &str, session: Option<String>) {
+    if LEGACY_FALSY
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(auto_report.trim()))
+    {
+        return;
+    }
+    let mut event = String::new();
+    if !std::io::stdin().is_terminal() {
+        let _ = std::io::stdin().read_to_string(&mut event);
+    }
+    let event_session = serde_json::from_str::<serde_json::Value>(&event)
+        .ok()
+        .and_then(|v| {
+            v.get("session_id")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned)
+        });
+    let report = legacy_report_for(
+        Agent::ZCode,
+        session.or_else(|| event_session.filter(|s| !s.is_empty())),
+    )
+    .or_else(|| legacy_report_for(Agent::ZCode, None));
+    let Some(report) = report else { return };
+    let Some(turn) = report.turns.first() else {
+        return;
+    };
+    let (speed, estimated) = legacy_speed(turn);
+    let mark = if estimated { "~" } else { "" };
+    let model = turn.model.as_deref().unwrap_or("-");
+    let text = format!(
+        "⚡ {mark}{speed:.1} tok/s | {model} | {} tokens / {mark}{}",
+        legacy_thousands(turn.output_tokens as i64),
+        legacy_secs(turn.completed_at.saturating_sub(turn.started_at)),
+    );
+    println!("{}", serde_json::json!({ "additionalContext": text }));
+}
+
+fn legacy_report(agents: &[Agent], limit: usize) -> i32 {
+    let mut reports: Vec<(Agent, Option<FollowerReport>)> = Vec::new();
+    for &agent in agents {
+        let report = legacy_report_for(agent, None);
+        reports.push((agent, report));
+    }
+    let mut all_rows: Vec<(Agent, &TurnMeasurement)> = reports
+        .iter()
+        .filter_map(|(agent, report)| report.as_ref().map(|r| (*agent, r)))
+        .flat_map(|(agent, report)| report.turns.iter().map(move |turn| (agent, turn)))
+        .collect();
+    all_rows.sort_by(|a, b| b.1.completed_at.cmp(&a.1.completed_at));
+    let Some((head_agent, head)) = all_rows.first().copied() else {
+        println!("没有找到已完成的模型请求数据。");
+        return 0;
+    };
+    println!("⚡ 最近一次: {}", legacy_latest_line(head_agent, head));
+    if agents.len() > 1 {
+        println!("🧰 各工具最近一次:");
+        for &(agent, ref report) in &reports {
+            let line = report
+                .as_ref()
+                .and_then(|r| r.turns.first())
+                .map(|turn| legacy_latest_line(agent, turn));
+            match line {
+                Some(line) => println!("  {line}"),
+                None => println!("  [{}] （无本地会话数据）", legacy_tag(agent)),
+            }
+        }
+        println!("   （~ 前缀 = 按本地会话记录估算，含工具执行时间）");
+    }
+    if agents.contains(&Agent::ZCode) {
+        if let Some(report) = reports
+            .iter()
+            .find(|(agent, _)| *agent == Agent::ZCode)
+            .and_then(|(_, report)| report.as_ref())
+        {
+            if report.session_total_elapsed_ms > 0 {
+                let avg = report.session_total_tokens as f64 * 1000.0
+                    / report.session_total_elapsed_ms as f64;
+                let sid = &report.session;
+                let sid_short = if sid.chars().count() > 22 {
+                    format!("{}…", sid.chars().take(19).collect::<String>())
+                } else {
+                    sid.clone()
+                };
+                println!(
+                    "📊 ZCode 会话 {sid_short} 汇总: 最近 {} 轮 | 加权平均 {avg:.1} tok/s | 共输出 {} tokens / 生成 {}",
+                    report.turns.len(),
+                    legacy_thousands(report.session_total_tokens as i64),
+                    legacy_secs(report.session_total_elapsed_ms as i64),
+                );
+            }
+        }
+    }
+    let label = if agents.len() > 1 {
+        "全部工具"
+    } else {
+        legacy_name(agents[0])
+    };
+    let rows: Vec<(Agent, &TurnMeasurement)> = all_rows.into_iter().take(limit).collect();
+    println!("📋 最近 {} 次 ({label}):", rows.len());
+    println!(
+        "  {:<4}{:<14} {:<22} {:>9} {:>9} {:>8}",
+        "SRC", "TIME", "MODEL", "TOK/S", "OUT", "GEN"
+    );
+    for (agent, turn) in rows {
+        let (speed, estimated) = legacy_speed(turn);
+        let gen = format!(
+            "{}{}",
+            if estimated { "~" } else { " " },
+            legacy_secs(turn.completed_at.saturating_sub(turn.started_at))
+        );
+        println!(
+            "  {:<4}{:<14} {:<22} {:>8.1} {:>9} {:>8}",
+            legacy_tag(agent),
+            legacy_ts(turn.completed_at),
+            turn.model.as_deref().unwrap_or("-"),
+            speed,
+            legacy_thousands(turn.output_tokens as i64),
+            gen,
+        );
+    }
+    0
+}
