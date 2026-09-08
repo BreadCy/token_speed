@@ -1,0 +1,5 @@
+{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sess-cx-mismatch","cwd":"/redacted/codex-project","model":"gpt-redacted"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"turn_id":"turn-cx-active"}}
+{"timestamp":"2026-01-01T00:01:40Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-cx-active","started_at":100}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":10}}}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-cx-other","started_at":100,"completed_at":300}}

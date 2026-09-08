@@ -1,7 +1,9 @@
 use crate::collectors::{Accuracy, Agent};
 use crate::config::{Config, FollowMode};
 use crate::menubar::{Menubar, TrayCommand};
-use crate::monitor::{spawn_engine, AgentStatus, EngineEvent, EngineHandle, FollowerReport};
+use crate::monitor::{
+    spawn_engine, AgentStatus, AgentTotals, EngineEvent, EngineHandle, FollowerReport,
+};
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -31,13 +33,18 @@ const WIN_W: f32 = 400.0;
 /// 最后一行会被截成半行露出框外；不足 7 行时按实际行数自适应
 const RECENTS_OPEN_H: f32 = 182.0;
 const RECENTS_ROW_H: f32 = 26.0;
+/// Frame 内表头与列表之间的 item_spacing：列表展开时 Frame 实际增高 =
+/// 列表高度 + 此值，卡片高度公式必须计入，否则状态行到底边的距离
+/// 在收起/展开两种状态下不一致（实测差 5px，2026-09-08）
+const LIST_EXTRA_H: f32 = 6.0;
 /// 主卡收起态高度（Agent 切换与固定项目两行已移入设置抽屉）。
 /// 不可低于内容自然高度：内容顶穿窗口底部会把 painted 圆角盖成直角
-const MAIN_CLOSED_H: f32 = 307.0;
-/// 主模式窗口恒定高度 = 最高内容态（展开 10 轮）。卡片在窗口内伸缩（收起/展开/
-/// 设置），卡片下方透明区点击穿透——与球态同一架构，主模式不再 resize 窗口，
-/// 从根上消灭 resize 事件丢失导致的"卡片被裁/圆角变直角"
-const MAIN_MAX_H: f32 = MAIN_CLOSED_H + RECENTS_OPEN_H;
+const MAIN_CLOSED_H: f32 = 345.0;
+/// 主模式窗口恒定高度 = 最高内容态（轮次与全项目明细两个列表同时展开）。
+/// 卡片在窗口内伸缩（收起/展开/设置），卡片下方透明区点击穿透——与球态同一
+/// 架构，主模式不再 resize 窗口，从根上消灭 resize 事件丢失导致的"卡片被裁/
+/// 圆角变直角"。两个列表各自独立展开，不再共享预算
+const MAIN_MAX_H: f32 = MAIN_CLOSED_H + (RECENTS_OPEN_H + LIST_EXTRA_H) * 2.0;
 const BALL: f32 = 64.0;
 /// 球体/胶囊体外圈的透明边：留给 ping 光环外扩，避免被窗口裁剪
 const BODY_MARGIN: f32 = 8.0;
@@ -181,13 +188,45 @@ pub(crate) fn recents_list_height(turn_count: usize) -> f32 {
     }
 }
 
-pub(crate) fn main_window_height(recents_open: bool, turn_count: usize) -> f32 {
-    MAIN_CLOSED_H
-        + if recents_open {
-            recents_list_height(turn_count)
-        } else {
-            0.0
-        }
+/// 全项目明细展开高度：与最近轮次同一行高与封顶（共享 182px 展开预算）
+pub(crate) fn totals_list_height(project_count: usize) -> f32 {
+    if project_count == 0 {
+        26.0 // 空态提示「暂无数据」
+    } else {
+        (RECENTS_ROW_H * project_count as f32).min(RECENTS_OPEN_H)
+    }
+}
+
+pub(crate) fn main_window_height(
+    recents_open: bool,
+    turn_count: usize,
+    totals_open: bool,
+    project_count: usize,
+) -> f32 {
+    // 两个列表各自独立展开，高度直接相加（窗口恒定 MAIN_MAX_H 已容纳两者同开）。
+    // 每个展开的列表除自身高度外还带 6px 的表头→列表 item_spacing
+    let recents = if recents_open {
+        recents_list_height(turn_count) + LIST_EXTRA_H
+    } else {
+        0.0
+    };
+    let totals = if totals_open {
+        totals_list_height(project_count) + LIST_EXTRA_H
+    } else {
+        0.0
+    };
+    MAIN_CLOSED_H + recents + totals
+}
+
+/// token 数紧凑格式：1.2M / 45.2K / 890（精确值放悬浮提示）
+pub(crate) fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// 主显示器可用高度（点）：扣菜单栏与安全边距。
@@ -395,6 +434,8 @@ struct TokenSpeedApp {
     show_settings: bool,
     /// 设置窗的暂存草稿：打开时从 config 播种，保存才回写（取消/Esc/✕ 丢弃）
     recents_open: bool,
+    /// 「最近 10 轮」表头里全项目累计明细的展开态（共享列表展开预算）
+    totals_open: bool,
     /// 悬浮球是否已双击展开为胶囊条
     capsule_open: bool,
     /// 球/胶囊体的当前宽度（动画中的值）
@@ -436,6 +477,7 @@ impl TokenSpeedApp {
             paused: false,
             show_settings: false,
             recents_open: false,
+            totals_open: false,
             capsule_open: false,
             ball_w: BALL,
             capsule_target: BALL,
@@ -852,7 +894,7 @@ fn accuracy_cell(accuracy: Accuracy) -> (&'static str, egui::Color32) {
 
 /// 三格指标：模型速度 / 最近一轮 / 会话加权平均（画布直绘，列宽恒定）
 fn paint_tri(ui: &mut egui::Ui, cells: [(String, Option<(String, egui::Color32)>); 3]) {
-    let labels = ["模型速度", "最近一轮", "会话加权平均"];
+    let labels = ["模型速度", "会话加权平均", "Token 总量"];
     egui::Frame::new()
         .fill(SURFACE)
         .stroke(egui::Stroke::new(1.0, LINE))
@@ -899,25 +941,26 @@ fn paint_tri(ui: &mut egui::Ui, cells: [(String, Option<(String, egui::Color32)>
         });
 }
 
-/// 折叠箭头（矢量三角，不占文字列宽）：center 为三角形中心
+/// 折叠箭头（矢量三角，不占文字列宽）：center 为三角形包围盒中心
 fn paint_caret(painter: &egui::Painter, center: egui::Pos2, open: bool, color: egui::Color32) {
-    // 两态取相近的小体量（约 7×5.5px），切换时大小不跳变；
-    // 三角形视觉质心偏几何中心上方，整体下移 1px 与表头文字中线对齐
+    // 两态是同一个等腰三角形绕包围盒中点（归一化锚点 0.5,0.5）旋转 90° 的关系：
+    // 基准 ▸（5.5 宽 × 7 高），open 时各顶点绕中点顺时针转 90° 得 ▾（7 宽 × 5.5 高），
+    // 切换时是原地旋转而不是换形跳变。
+    // 三角形视觉质心偏向钝角侧，整体下移 1px 与表头文字中线对齐
     let c = egui::pos2(center.x, center.y + 1.0);
+    // 基准 ▸：左边两个角 + 右侧尖点，顶点相对包围盒中点对称分布
+    let base = [
+        egui::pos2(c.x - 2.75, c.y - 3.5),
+        egui::pos2(c.x - 2.75, c.y + 3.5),
+        egui::pos2(c.x + 2.75, c.y),
+    ];
     let points: Vec<egui::Pos2> = if open {
-        // ▾：顶边两个角 + 底部尖点
-        vec![
-            egui::pos2(c.x - 3.5, c.y - 2.0),
-            egui::pos2(c.x + 3.5, c.y - 2.0),
-            egui::pos2(c.x, c.y + 3.5),
-        ]
+        // 顺时针 90°（屏幕 y 向下）：相对中点的位移 (dx,dy) → (-dy,dx)
+        base.iter()
+            .map(|p| egui::pos2(c.x - (p.y - c.y), c.y + (p.x - c.x)))
+            .collect()
     } else {
-        // ▸：左边两个角 + 右侧尖点
-        vec![
-            egui::pos2(c.x - 2.0, c.y - 3.5),
-            egui::pos2(c.x - 2.0, c.y + 3.5),
-            egui::pos2(c.x + 2.5, c.y),
-        ]
+        base.to_vec()
     };
     painter.add(egui::Shape::convex_polygon(
         points,
@@ -926,41 +969,65 @@ fn paint_caret(painter: &egui::Painter, center: egui::Pos2, open: bool, color: e
     ));
 }
 
-/// 最近 10 轮：默认收起为一行按钮，点击展开细线列表。
-/// 表头文字与数据行共用同一列网格（锚定 ScrollArea 的 inner_rect）：
-/// 「最近 10 轮」左对齐「第 N 轮」，箭头挂在左侧 padding 内；右侧轮数对齐行尾。
-fn paint_recent(ui: &mut egui::Ui, turns: &[TurnSnapshot], open: &mut bool, viewport_h: f32) {
+/// 两个独立可展开区块：最近 10 轮、全项目累计，各有自己的表头与 caret。
+/// 拆分前两者挤在同一表头行（右角双热区），全项目累计的数字一长就拥挤难读。
+fn paint_recent(
+    ui: &mut egui::Ui,
+    turns: &[TurnSnapshot],
+    totals: Option<&AgentTotals>,
+    open: &mut bool,
+    totals_open: &mut bool,
+    recents_viewport: f32,
+    totals_viewport: f32,
+) {
+    paint_turns_section(ui, turns, open, recents_viewport);
+    ui.add_space(5.0);
+    paint_totals_section(ui, totals, totals_open, totals_viewport);
+}
+
+/// 第一节：最近 10 轮。表头点击展开/收起轮次列表。
+fn paint_turns_section(ui: &mut egui::Ui, turns: &[TurnSnapshot], open: &mut bool, viewport: f32) {
+    let section_open = *open && viewport > 0.0;
+    // 收起态整框即表头：悬停直接换 Frame 填充色。fill 与 stroke 是同一形状
+    // 一次绘制的，圆角几何与常态构造性一致——手绘高亮矩形的圆弧与描边弧
+    // 永远存在亚像素偏差，四角看起来"圆角不太一样"
+    let probe = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), 38.0),
+    );
+    let frame_fill = if !section_open && ui.rect_contains_pointer(probe) {
+        HOVER
+    } else {
+        LIST_BG
+    };
     egui::Frame::new()
-        .fill(LIST_BG)
+        .fill(frame_fill)
         .stroke(egui::Stroke::new(1.0, LINE))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(0))
         .show(ui, |ui| {
             let (head, head_resp) = ui
                 .allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
-            if head_resp.hovered() {
-                // 悬停高亮跟随列表框圆角：展开时只圆顶部，收起时四角全圆
-                let radius = if *open {
+            if head_resp.clicked() {
+                *open = !*open;
+            }
+            if head_resp.hovered() && section_open {
+                // 展开态：框身被列表占据，只在表头带画高亮（顶部圆角、底部方角）
+                ui.painter().rect_filled(
+                    head.expand(0.5),
                     egui::CornerRadius {
                         nw: 6,
                         ne: 6,
                         sw: 0,
                         se: 0,
-                    }
-                } else {
-                    egui::CornerRadius::same(6)
-                };
-                ui.painter().rect_filled(head, radius, HOVER);
-            }
-            if head_resp.clicked() {
-                *open = !*open;
+                    },
+                    HOVER,
+                );
             }
 
-            // 表头文字/箭头/分割线的锚点一律用 head（确定性矩形），
-            // 不用 ScrollArea 的 inner_rect（随滚动偏移与布局状态漂移）
-            if *open {
+            if section_open {
                 let mut out = egui::ScrollArea::vertical()
-                    .max_height(viewport_h)
+                    .max_height(viewport)
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
@@ -1009,12 +1076,11 @@ fn paint_recent(ui: &mut egui::Ui, turns: &[TurnSnapshot], open: &mut bool, view
                 }
             }
 
-            // 表头最后绘制：与数据行同列起点/终点，箭头占左侧 padding 不推挤文字列
+            // 表头最后绘制：与数据行同列起点/终点，箭头挂在左侧 padding 不推挤文字列
             let cy = head.center().y;
             let strong = head_resp.hovered();
             let painter = ui.painter();
-            // 表头下的整条分割线（展开时）：独立于列表项之间的分割线，后者保持不变
-            if *open {
+            if section_open {
                 painter.line_segment(
                     [
                         egui::pos2(head.left() + 6.0, head.bottom()),
@@ -1023,25 +1089,210 @@ fn paint_recent(ui: &mut egui::Ui, turns: &[TurnSnapshot], open: &mut bool, view
                     egui::Stroke::new(1.0, LINE),
                 );
             }
+            // caret 对齐基准是文字的墨迹中心而非几何中心：CJK 墨迹比几何
+            // 中心高 ~2.5px，传 cy-0.5（paint_caret 内部再 +1）后三角墨迹
+            // 中心 = 文字墨迹中心，实测对齐（2026-09-08）
             paint_caret(
                 painter,
-                egui::pos2(head.left() + 6.0, cy + 1.0),
+                egui::pos2(head.left() + 6.0, cy - 0.5),
                 *open,
                 if strong { TEXT } else { MUTED },
             );
             // 表头用 proportional：CJK 与数字同字体（Hiragino 内含拉丁字形），
-            // 等宽字体的数字相对汉字明显偏小且字距发空
+            // 等宽字体的数字相对汉字明显偏小且字距发空。
+            // 36px 表头行的光学补偿是 +3（墨迹中心对齐行带中心下 0.5px，
+            // 与三格指标行一致；+2 时用户反馈文本偏上，2026-09-08）
             painter.text(
-                egui::pos2(head.left() + 15.0, cy + 2.0),
+                egui::pos2(head.left() + 15.0, cy + 3.0),
                 egui::Align2::LEFT_CENTER,
                 "最近 10 轮",
                 egui::FontId::proportional(11.5),
                 if strong { TEXT } else { MUTED },
             );
             painter.text(
-                egui::pos2(head.right() - 12.0, cy + 2.0),
+                egui::pos2(head.right() - 12.0, cy + 3.0),
                 egui::Align2::RIGHT_CENTER,
                 format!("{} 轮", turns.len()),
+                egui::FontId::proportional(11.5),
+                MUTED,
+            );
+        });
+}
+
+/// 第二节：全项目累计（输入+输出，全部本地历史）。表头点击展开按项目分组明细。
+fn paint_totals_section(
+    ui: &mut egui::Ui,
+    totals: Option<&AgentTotals>,
+    totals_open: &mut bool,
+    viewport: f32,
+) {
+    let section_open = *totals_open && totals.is_some() && viewport > 0.0;
+    // 同 turns section：收起态悬停换 Frame 填充色，圆角与常态构造性一致
+    let probe = egui::Rect::from_min_size(
+        ui.cursor().min,
+        egui::vec2(ui.available_width(), 38.0),
+    );
+    let frame_fill = if !section_open && ui.rect_contains_pointer(probe) {
+        HOVER
+    } else {
+        LIST_BG
+    };
+    egui::Frame::new()
+        .fill(frame_fill)
+        .stroke(egui::Stroke::new(1.0, LINE))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(0))
+        .show(ui, |ui| {
+            let (head, head_resp) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::click());
+            let total_text = match totals {
+                Some(totals) if totals.total_tokens > 0 => {
+                    format!("全项目累计 {}", compact_tokens(totals.total_tokens))
+                }
+                _ => "全项目累计 —".to_string(),
+            };
+            let head_resp = match totals {
+                Some(totals) if totals.total_tokens > 0 => head_resp.on_hover_text(format!(
+                    "{} tokens · 输入+输出，全部本地历史",
+                    totals.total_tokens
+                )),
+                _ => head_resp,
+            };
+            if head_resp.clicked() && totals.is_some() {
+                *totals_open = !*totals_open;
+            }
+            if head_resp.hovered() && section_open {
+                // 展开态：只在表头带画高亮（顶部圆角、底部方角），同 turns section
+                ui.painter().rect_filled(
+                    head.expand(0.5),
+                    egui::CornerRadius {
+                        nw: 6,
+                        ne: 6,
+                        sw: 0,
+                        se: 0,
+                    },
+                    HOVER,
+                );
+            }
+
+            if section_open {
+                let projects = totals.map(|totals| &totals.projects).unwrap();
+                let mut out = egui::ScrollArea::vertical()
+                    .max_height(viewport)
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        if projects.is_empty() {
+                            let (block, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 26.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().text(
+                                egui::pos2(block.left() + 12.0, block.center().y + 2.0),
+                                egui::Align2::LEFT_CENTER,
+                                "暂无数据",
+                                egui::FontId::proportional(11.5),
+                                MUTED,
+                            );
+                        } else {
+                            let row_h = RECENTS_ROW_H;
+                            let (block, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), row_h * projects.len() as f32),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter();
+                            for (i, project) in projects.iter().enumerate() {
+                                let y = block.top() + row_h * i as f32;
+                                if i > 0 {
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(block.left() + 6.0, y),
+                                            egui::pos2(block.right() - 6.0, y),
+                                        ],
+                                        egui::Stroke::new(1.0, LINE),
+                                    );
+                                }
+                                let cy = y + row_h / 2.0 + 2.0;
+                                let name = project.project.as_deref().map_or_else(
+                                    || "（无项目）".to_string(),
+                                    |path| {
+                                        std::path::Path::new(path)
+                                            .file_name()
+                                            .and_then(|name| name.to_str())
+                                            .map(str::to_owned)
+                                            .unwrap_or_else(|| path.to_owned())
+                                    },
+                                );
+                                let row_resp = ui
+                                    .interact(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(block.left(), y),
+                                            egui::pos2(block.right(), y + row_h),
+                                        ),
+                                        egui::Id::new(("ts-project-row", i)),
+                                        egui::Sense::hover(),
+                                    )
+                                    .on_hover_text(project.project.as_deref().unwrap_or(
+                                        "该 agent 部分会话缺少项目目录，单独归为一组",
+                                    ));
+                                let _ = row_resp;
+                                painter.text(
+                                    egui::pos2(block.left() + 12.0, cy),
+                                    egui::Align2::LEFT_CENTER,
+                                    name,
+                                    egui::FontId::proportional(11.5),
+                                    MUTED,
+                                );
+                                painter.text(
+                                    egui::pos2(block.right() - 12.0, cy),
+                                    egui::Align2::RIGHT_CENTER,
+                                    compact_tokens(project.tokens),
+                                    egui::FontId::proportional(11.5),
+                                    TEXT,
+                                );
+                            }
+                        }
+                    });
+                // 滚动偏移吸附到行高整数倍（与最近轮次列表同一处理）
+                let snapped = (out.state.offset.y / RECENTS_ROW_H).round() * RECENTS_ROW_H;
+                if snapped != out.state.offset.y {
+                    out.state.offset.y = snapped;
+                    out.state.store(ui.ctx(), out.id);
+                }
+            }
+
+            let cy = head.center().y;
+            let strong = head_resp.hovered();
+            let painter = ui.painter();
+            if section_open {
+                painter.line_segment(
+                    [
+                        egui::pos2(head.left() + 6.0, head.bottom()),
+                        egui::pos2(head.right() - 6.0, head.bottom()),
+                    ],
+                    egui::Stroke::new(1.0, LINE),
+                );
+            }
+            // 对齐文字墨迹中心，同 turns section 的 caret 说明
+            paint_caret(
+                painter,
+                egui::pos2(head.left() + 6.0, cy - 0.5),
+                *totals_open,
+                if strong { TEXT } else { MUTED },
+            );
+            // +3 光学补偿同 turns section（36px 行带）
+            painter.text(
+                egui::pos2(head.left() + 15.0, cy + 3.0),
+                egui::Align2::LEFT_CENTER,
+                total_text,
+                egui::FontId::proportional(11.5),
+                if strong { TEXT } else { MUTED },
+            );
+            let projects = totals.map(|totals| totals.projects.len()).unwrap_or(0);
+            painter.text(
+                egui::pos2(head.right() - 12.0, cy + 3.0),
+                egui::Align2::RIGHT_CENTER,
+                format!("{projects} 项目"),
                 egui::FontId::proportional(11.5),
                 MUTED,
             );
@@ -1595,12 +1846,21 @@ impl eframe::App for TokenSpeedApp {
         }
 
         // 主卡片高度：内容态高度，且不超过实际窗口（macOS 对超高窗口的钳制）
+        let turn_count = self.report.as_ref().map_or(0, |report| report.turns.len());
+        let display_agent = self.display;
+        let project_count = self
+            .statuses
+            .iter()
+            .find(|status| Some(status.agent) == display_agent)
+            .map_or(0, |status| status.totals.projects.len());
         let main_card_h = if self.show_settings {
             SETTINGS_H
         } else {
             main_window_height(
                 self.recents_open,
-                self.report.as_ref().map_or(0, |report| report.turns.len()),
+                turn_count,
+                self.totals_open,
+                project_count,
             )
         }
         .min(
@@ -1615,12 +1875,22 @@ impl eframe::App for TokenSpeedApp {
         );
         self.main_card_h = main_card_h;
         // 列表滚动视口随卡片实际高度收缩：屏幕矮时少显示几行（仍可滚），
-        // 保证状态行与四角圆角不被裁掉
-        let list_viewport = ((main_card_h - MAIN_CLOSED_H).max(26.0))
-            .min(recents_list_height(
-                self.report.as_ref().map_or(0, |report| report.turns.len()),
-            ))
-            .max(26.0);
+        // 保证状态行与四角圆角不被裁掉。最近轮次优先占预算，剩余给全项目明细。
+        // 视口只含列表行高（LIST_EXTRA_H 的 item_spacing 不进视口）
+        let avail = (main_card_h - MAIN_CLOSED_H).max(0.0);
+        let recents_scroll = if self.recents_open {
+            recents_list_height(turn_count)
+        } else {
+            0.0
+        };
+        let recents_budget = recents_scroll + if recents_scroll > 0.0 { LIST_EXTRA_H } else { 0.0 };
+        let totals_scroll = if self.totals_open {
+            totals_list_height(project_count)
+        } else {
+            0.0
+        };
+        let list_viewport = recents_scroll.min(avail).max(26.0);
+        let totals_viewport = totals_scroll.min((avail - recents_budget).max(0.0));
 
         // 穿透状态机：光标线程按"可交互矩形"驱动（光标在矩形内=可交互，离开=穿透）
         // - 主界面 = 卡片矩形（窗口底部透明区穿透）
@@ -1692,14 +1962,15 @@ impl eframe::App for TokenSpeedApp {
                         None => ("—".to_string(), Some(("无可靠区间".to_string(), MUTED))),
                     },
                 );
-                let last_cell = turn0.map_or_else(
+                // 当前会话累计（输入+输出，全部完成轮）；全项目累计在下方列表表头
+                let total_cell = self.report.as_ref().map_or_else(
                     || ("—".to_string(), None),
-                    |turn| {
-                        let (label, color) = accuracy_cell(turn.accuracy);
-                        (
-                            format!("{:.3}", turn.effective_speed),
-                            Some((label.to_string(), color)),
-                        )
+                    |report| {
+                        let total = report
+                            .session_total_tokens
+                            .saturating_add(report.session_total_input_tokens);
+                        let (label, color) = accuracy_cell(report.session_accuracy);
+                        (compact_tokens(total), Some((label.to_string(), color)))
                     },
                 );
                 let turns: Vec<TurnSnapshot> = self
@@ -1718,6 +1989,11 @@ impl eframe::App for TokenSpeedApp {
                             .collect()
                     })
                     .unwrap_or_default();
+                let totals: Option<AgentTotals> = self
+                    .statuses
+                    .iter()
+                    .find(|status| Some(status.agent) == self.display)
+                    .map(|status| status.totals.clone());
                 let agent_name = Self::agent_label(agent).to_string();
                 let dot = if running && !paused {
                     AMBER
@@ -1810,10 +2086,18 @@ impl eframe::App for TokenSpeedApp {
                                 });
 
                                 ui.add_space(9.0);
-                                paint_tri(ui, [model_cell, last_cell, avg_cell]);
+                                paint_tri(ui, [model_cell, avg_cell, total_cell]);
 
                                 ui.add_space(5.0);
-                                paint_recent(ui, &turns, &mut self.recents_open, list_viewport);
+                                paint_recent(
+                                    ui,
+                                    &turns,
+                                    totals.as_ref(),
+                                    &mut self.recents_open,
+                                    &mut self.totals_open,
+                                    list_viewport,
+                                    totals_viewport,
+                                );
 
                                 ui.add_space(5.0);
                                 self.paint_status_row(ui, running, has_data);

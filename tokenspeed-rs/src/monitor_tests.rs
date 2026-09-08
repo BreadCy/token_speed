@@ -1,7 +1,9 @@
 use super::collectors::Agent;
+use super::collectors::Snapshot;
 use super::monitor::{
-    detect_all_installed, is_relevant_change, path_matches, run_engine, scan_once, snapshots_for,
-    EngineEvent, EngineOptions, Selector, SourceKind, SourceLocation,
+    aggregate_totals, detect_all_installed, is_relevant_change, path_matches, rebuild_session_totals,
+    run_engine, scan_once, snapshots_for, AgentTotals, EngineEvent, EngineOptions, Selector,
+    SourceKind, SourceLocation,
 };
 use std::fs;
 use std::path::Path;
@@ -696,4 +698,70 @@ fn scan_once_honors_project_and_session_pins_without_fallback_and_is_read_only()
         None => std::env::remove_var("ZCODE_HOME"),
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+fn totals_snapshot(id: &str, project: Option<&str>, output: u64, input: u64) -> Snapshot {
+    Snapshot {
+        agent: Agent::Codex,
+        session: crate::collectors::SessionRef {
+            id: id.into(),
+            project: project.map(str::to_owned),
+        },
+        turns: Vec::new(),
+        all_turns: Vec::new(),
+        session_total_tokens: output,
+        session_total_input_tokens: input,
+        session_total_elapsed_ms: 0,
+        session_accuracy: crate::collectors::Accuracy::Estimated,
+        activity_at: 0,
+        running: false,
+    }
+}
+
+#[test]
+fn totals_aggregate_by_project_sorted_descending_with_unknown_bucket() {
+    use std::collections::HashMap;
+
+    let snapshots = vec![
+        totals_snapshot("s1", Some("/work/alpha"), 100, 900),
+        totals_snapshot("s2", Some("/work/beta"), 50, 50),
+        totals_snapshot("s3", Some("/work/alpha"), 10, 0),
+        totals_snapshot("s4", None, 7, 3),
+    ];
+    let mut slot = HashMap::new();
+    rebuild_session_totals(&mut slot, &snapshots);
+    assert_eq!(slot.len(), 4);
+    let totals = aggregate_totals(&slot);
+    // 总数 = 明细之和（无项目组也计入）
+    assert_eq!(totals.total_tokens, 1120);
+    assert_eq!(totals.projects.len(), 3);
+    // 按 tokens 降序
+    assert_eq!(totals.projects[0].project.as_deref(), Some("/work/alpha"));
+    assert_eq!(totals.projects[0].tokens, 1010);
+    assert_eq!(totals.projects[1].project.as_deref(), Some("/work/beta"));
+    assert_eq!(totals.projects[1].tokens, 100);
+    // 无项目会话单独归组，参与总数
+    assert_eq!(totals.projects[2].project, None);
+    assert_eq!(totals.projects[2].tokens, 10);
+}
+
+#[test]
+fn totals_rebuild_replaces_stale_entries_and_aggregate_of_empty_is_zero() {
+    use std::collections::HashMap;
+
+    let mut slot = HashMap::new();
+    slot.insert(
+        "deleted-session".to_string(),
+        (Some("/work/ghost".to_string()), 999),
+    );
+    let snapshots = vec![totals_snapshot("s1", Some("/work/alpha"), 10, 20)];
+    rebuild_session_totals(&mut slot, &snapshots);
+    // 全量重建清掉已消失的会话，总数不残留幽灵数据
+    assert_eq!(slot.len(), 1);
+    let totals = aggregate_totals(&slot);
+    assert_eq!(totals.total_tokens, 30);
+    assert_eq!(
+        aggregate_totals(&HashMap::new()),
+        AgentTotals::default()
+    );
 }

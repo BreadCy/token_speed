@@ -1,10 +1,10 @@
 use crate::collectors::Agent;
-use crate::monitor::AgentStatus;
+use crate::monitor::{AgentStatus, AgentTotals};
 #[cfg(target_os = "macos")]
 use crate::ui::system_cjk_font_path;
 use crate::ui::{
-    main_window_height, model_speed_text, pick_auto_agent, recents_list_height, relative_time,
-    weighted_average_speed,
+    compact_tokens, main_window_height, model_speed_text, pick_auto_agent, recents_list_height,
+    relative_time, totals_list_height, weighted_average_speed,
 };
 
 fn status(agent: Agent, installed: bool, running: bool, activity_at: i64) -> AgentStatus {
@@ -14,6 +14,7 @@ fn status(agent: Agent, installed: bool, running: bool, activity_at: i64) -> Age
         running,
         activity_at,
         report: None,
+        totals: AgentTotals::default(),
         error: None,
     }
 }
@@ -100,12 +101,46 @@ fn ui_relative_time_uses_human_units() {
 
 #[test]
 fn main_window_height_tracks_the_recents_content() {
-    assert_eq!(main_window_height(false, 0), 307.0);
-    // 满列表（7 行整封顶滚动，不留半行）
-    assert_eq!(main_window_height(true, 10), 489.0);
+    // 收起态 = 两节表头（最近 10 轮 + 全项目累计）
+    assert_eq!(main_window_height(false, 0, false, 0), 345.0);
+    // 满列表（7 行整封顶滚动，不留半行）；展开列表额外带 6px 表头→列表间距
+    assert_eq!(main_window_height(true, 10, false, 0), 345.0 + 182.0 + 6.0);
     // 行数少时窗口随列表收缩，不留空白死区
-    assert_eq!(main_window_height(true, 5), 437.0);
-    assert_eq!(main_window_height(true, 0), 337.0);
+    assert_eq!(main_window_height(true, 5, false, 0), 345.0 + 130.0 + 6.0);
+    assert_eq!(main_window_height(true, 0, false, 0), 345.0 + 30.0 + 6.0);
+}
+
+#[test]
+fn totals_list_expands_independently_from_recents() {
+    // 明细单独展开：最高 7 行封顶（与轮次列表同预算）
+    assert_eq!(main_window_height(false, 0, true, 12), 345.0 + 182.0 + 6.0);
+    // 明细行数少时贴合内容
+    assert_eq!(main_window_height(false, 0, true, 3), 345.0 + 78.0 + 6.0);
+    // 两个列表同时展开：高度直接相加，互不挤占
+    assert_eq!(
+        main_window_height(true, 10, true, 12),
+        345.0 + (182.0 + 6.0) * 2.0
+    );
+    assert_eq!(
+        main_window_height(true, 5, true, 3),
+        345.0 + (130.0 + 6.0) + (78.0 + 6.0)
+    );
+}
+
+#[test]
+fn totals_list_caps_at_the_scroll_viewport_like_recents() {
+    assert_eq!(totals_list_height(0), 26.0);
+    assert_eq!(totals_list_height(3), 78.0);
+    // 封顶 = 行高的整数倍（与轮次列表同预算 182）
+    assert_eq!(totals_list_height(12), 182.0);
+}
+
+#[test]
+fn compact_tokens_uses_human_units() {
+    assert_eq!(compact_tokens(890), "890");
+    assert_eq!(compact_tokens(45_200), "45.2K");
+    assert_eq!(compact_tokens(1_234_567), "1.2M");
+    assert_eq!(compact_tokens(0), "0");
 }
 
 #[test]

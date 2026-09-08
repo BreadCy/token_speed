@@ -10,3 +10,7 @@ tokenspeed/bin/*.exe
 # 构建产物
 _dist_artifacts/
 dist/
+
+# 测试 fixture 被全局 gitignore 的 tokenspeed-rs/tests 规则误伤，
+# 测试代码（collectors_tests/monitor_tests）依赖它们，必须进版本库
+!tokenspeed-rs/tests/

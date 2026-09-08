@@ -1,12 +1,12 @@
 use crate::collectors::{
-    collect_claude_with_running, collect_codex_with_running, collect_opencode_with_running,
-    collect_pi_with_running, collect_zcode_with_running, Accuracy, Agent, Snapshot,
-    TurnMeasurement,
+    collect_claude_files_with_running, collect_claude_with_running, collect_codex_with_running,
+    collect_opencode_with_running, collect_pi_files_with_running, collect_pi_with_running,
+    collect_zcode_with_running, Accuracy, Agent, Snapshot, SourceError, TurnMeasurement,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -87,6 +87,8 @@ pub struct FollowerReport {
     pub activity_at: i64,
     pub turns: Vec<TurnMeasurement>,
     pub session_total_tokens: u64,
+    #[serde(default)]
+    pub session_total_input_tokens: u64,
     pub session_total_elapsed_ms: i64,
     pub session_accuracy: crate::collectors::Accuracy,
 }
@@ -542,6 +544,7 @@ fn snapshots_for_codex_files(files: Vec<PathBuf>) -> Result<Vec<Snapshot>, Monit
                     turns: Vec::new(),
                     all_turns: Vec::new(),
                     session_total_tokens: 0,
+                    session_total_input_tokens: 0,
                     session_total_elapsed_ms: 0,
                     session_accuracy: Accuracy::Unavailable,
                     activity_at: 0,
@@ -564,6 +567,11 @@ fn snapshots_for_codex_files(files: Vec<PathBuf>) -> Result<Vec<Snapshot>, Monit
                 .all_turns
                 .iter()
                 .map(|turn| turn.output_tokens)
+                .sum();
+            snapshot.session_total_input_tokens = snapshot
+                .all_turns
+                .iter()
+                .map(|turn| turn.input_tokens)
                 .sum();
             snapshot.session_total_elapsed_ms = snapshot
                 .all_turns
@@ -612,6 +620,47 @@ pub(crate) fn snapshots_for(source: &SourceLocation) -> Result<Vec<Snapshot>, Mo
         SourceKind::PiSessions => collect_pi_with_running(&source.path)
             .map_err(|e| MonitorError::Source(e.to_string())),
     }
+}
+
+/// 全量扫描的容错版，专供总量聚合使用：历史累计不该因单个损坏文件清零。
+/// JSONL 源按文件逐个解析——坏文件跳过并记住首个真实错误；`NoCompletedTurn`
+/// 只是没有已完成轮次，视为空文件。全部文件都失败时才整体报错。
+/// db 源是单文件，维持原样（失败即报错）。会话与文件一一对应（Codex 在
+/// `snapshots_for_codex_files` 内部自行合并），因此逐文件结果直接拼接。
+fn tolerant_snapshots(source: &SourceLocation) -> Result<Vec<Snapshot>, MonitorError> {
+    if !matches!(
+        source.kind,
+        SourceKind::ClaudeProjects | SourceKind::PiSessions
+    ) {
+        return snapshots_for(source);
+    }
+    let files = jsonl_files(&source.path).map_err(|e| MonitorError::Io(e.to_string()))?;
+    let mut all: Vec<Snapshot> = Vec::new();
+    let mut first_error = None;
+    for file in files {
+        let result = match source.kind {
+            SourceKind::ClaudeProjects => {
+                collect_claude_files_with_running(std::slice::from_ref(&file))
+            }
+            _ => collect_pi_files_with_running(std::slice::from_ref(&file)),
+        };
+        match result {
+            Ok(mut found) => all.append(&mut found),
+            Err(SourceError::NoCompletedTurn) => {}
+            Err(error) => {
+                first_error.get_or_insert((file, error));
+            }
+        }
+    }
+    if all.is_empty() {
+        let error = first_error.map_or_else(
+            || MonitorError::Source(SourceError::NoCompletedTurn.to_string()),
+            |(path, error)| MonitorError::Source(format!("{}: {error}", path.display())),
+        );
+        return Err(error);
+    }
+    all.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.activity_at));
+    Ok(all)
 }
 
 fn snapshots_for_selector(
@@ -677,11 +726,76 @@ pub(crate) fn is_relevant_change(
     }
 }
 
+/// One project's cumulative token usage (input + output, all completed turns,
+/// full local history). `project: None` buckets sessions without a project dir.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectTotals {
+    pub project: Option<String>,
+    pub tokens: u64,
+}
+
+/// One agent's usage totals across all projects. `projects` is sorted by tokens
+/// descending and `total_tokens` equals the sum of its entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTotals {
+    pub total_tokens: u64,
+    pub projects: Vec<ProjectTotals>,
+}
+
+/// Per-agent cache of session-level usage keyed by session id. The event path
+/// upserts only the active session (cheap latest-session scan); startup, explicit
+/// rescan, and every reconcile tick rebuild the whole entry from a full scan, so
+/// dormant history can never drift. Never do the full rebuild on file events —
+/// that is the "event-driven full rescan" regression the engine was redesigned
+/// to avoid.
+type SessionTotalsCache = HashMap<Agent, HashMap<String, (Option<String>, u64)>>;
+
+pub(crate) fn rebuild_session_totals(
+    slot: &mut HashMap<String, (Option<String>, u64)>,
+    snapshots: &[Snapshot],
+) {
+    slot.clear();
+    for snapshot in snapshots {
+        let tokens = snapshot
+            .session_total_tokens
+            .saturating_add(snapshot.session_total_input_tokens);
+        slot.insert(
+            snapshot.session.id.clone(),
+            (snapshot.session.project.clone(), tokens),
+        );
+    }
+}
+
+pub(crate) fn aggregate_totals(cache: &HashMap<String, (Option<String>, u64)>) -> AgentTotals {
+    let mut by_project: HashMap<Option<String>, u64> = HashMap::new();
+    for (project, tokens) in cache.values() {
+        *by_project.entry(project.clone()).or_insert(0) += tokens;
+    }
+    let mut projects: Vec<ProjectTotals> = by_project
+        .into_iter()
+        .map(|(project, tokens)| ProjectTotals { project, tokens })
+        .collect();
+    projects.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.project.cmp(&b.project)));
+    let total_tokens = projects.iter().map(|project| project.tokens).sum();
+    AgentTotals {
+        total_tokens,
+        projects,
+    }
+}
+
 fn report_for(
     selector: &Selector,
     source: SourceLocation,
 ) -> Result<Option<FollowerReport>, MonitorError> {
     let snapshots = snapshots_for_selector(&source, selector)?;
+    Ok(select_report(snapshots, selector, source))
+}
+
+fn select_report(
+    snapshots: Vec<Snapshot>,
+    selector: &Selector,
+    source: SourceLocation,
+) -> Option<FollowerReport> {
     let selected = snapshots.into_iter().filter(|snapshot| {
         selector.matches(snapshot.session.project.as_deref(), &snapshot.session.id)
     });
@@ -690,7 +804,7 @@ fn report_for(
             .activity_at
             .max(snapshot.turns.first().map_or(0, |turn| turn.completed_at))
     });
-    Ok(snapshot.map(|snapshot| FollowerReport {
+    snapshot.map(|snapshot| FollowerReport {
         agent: snapshot.agent,
         source,
         project: snapshot.session.project,
@@ -701,9 +815,10 @@ fn report_for(
             .max(snapshot.turns.first().map_or(0, |turn| turn.completed_at)),
         turns: snapshot.turns.into_iter().take(10).collect(),
         session_total_tokens: snapshot.session_total_tokens,
+        session_total_input_tokens: snapshot.session_total_input_tokens,
         session_total_elapsed_ms: snapshot.session_total_elapsed_ms,
         session_accuracy: snapshot.session_accuracy,
-    }))
+    })
 }
 
 pub fn scan_once(selector: &Selector) -> Result<Option<FollowerReport>, MonitorError> {
@@ -722,6 +837,8 @@ pub struct AgentStatus {
     pub running: bool,
     pub activity_at: i64,
     pub report: Option<FollowerReport>,
+    #[serde(default)]
+    pub totals: AgentTotals,
     pub error: Option<String>,
 }
 
@@ -793,7 +910,17 @@ pub fn spawn_engine(project: Option<String>) -> (EngineHandle, mpsc::Receiver<En
     (handle, rx)
 }
 
-fn collect_statuses(project: Option<&str>, sources: &[SourceLocation]) -> Vec<AgentStatus> {
+pub(crate) fn collect_statuses(
+    project: Option<&str>,
+    sources: &[SourceLocation],
+    totals_cache: &mut SessionTotalsCache,
+    full: bool,
+) -> Vec<AgentStatus> {
+    let installed: Vec<Agent> = sources.iter().map(|source| source.kind.agent()).collect();
+    // 全量重建时清掉已卸载 agent 的缓存条目，避免幽灵项目留在明细里
+    if full {
+        totals_cache.retain(|agent, _| installed.contains(agent));
+    }
     [
         Agent::ZCode,
         Agent::Codex,
@@ -804,13 +931,14 @@ fn collect_statuses(project: Option<&str>, sources: &[SourceLocation]) -> Vec<Ag
     .into_iter()
     .map(
         |agent| match sources.iter().find(|source| source.kind.agent() == agent) {
-            Some(source) => scan_agent_status(project, source),
+            Some(source) => scan_agent_status(project, source, totals_cache, full),
             None => AgentStatus {
                 agent,
                 installed: false,
                 running: false,
                 activity_at: 0,
                 report: None,
+                totals: AgentTotals::default(),
                 error: None,
             },
         },
@@ -820,39 +948,83 @@ fn collect_statuses(project: Option<&str>, sources: &[SourceLocation]) -> Vec<Ag
 
 /// Full rescan of one agent's source. Event bursts only re-scan the agents whose
 /// files actually changed (see `run_engine`); this keeps a single busy agent from
-/// making every emit re-parse the other three sources.
-fn scan_agent_status(project: Option<&str>, source: &SourceLocation) -> AgentStatus {
+/// making every emit re-parse the other sources.
+///
+/// `full` drives the totals cache: startup, explicit rescan, and reconcile ticks
+/// rebuild it from a full source scan; file events only upsert the latest
+/// session's entry (the event path must stay cheap — no full rescans).
+pub(crate) fn scan_agent_status(
+    project: Option<&str>,
+    source: &SourceLocation,
+    totals_cache: &mut SessionTotalsCache,
+    full: bool,
+) -> AgentStatus {
     let agent = source.kind.agent();
     let selector = Selector {
         agent,
         project: project.map(str::to_owned),
         session: None,
     };
-    match report_for(&selector, source.clone()) {
-        Ok(Some(report)) => AgentStatus {
+    let report = if full {
+        match tolerant_snapshots(source) {
+            // 全量扫描：先抽出会话级累计，再从同一份 snapshots 选出报告会话
+            Ok(snapshots) => {
+                rebuild_session_totals(totals_cache.entry(agent).or_default(), &snapshots);
+                select_report(snapshots, &selector, source.clone())
+            }
+            Err(error) => return errored_status(agent, error),
+        }
+    } else {
+        match report_for(&selector, source.clone()) {
+            Ok(Some(report)) => {
+                totals_cache.entry(agent).or_default().insert(
+                    report.session.clone(),
+                    (
+                        report.project.clone(),
+                        report
+                            .session_total_tokens
+                            .saturating_add(report.session_total_input_tokens),
+                    ),
+                );
+                Some(report)
+            }
+            // 无匹配会话（如项目固定后无活动）：缓存保持原样
+            Ok(None) => None,
+            Err(error) => return errored_status(agent, error),
+        }
+    };
+    let totals = aggregate_totals(totals_cache.entry(agent).or_default());
+    match report {
+        Some(report) => AgentStatus {
             agent,
             installed: true,
             running: report.running,
             activity_at: report.activity_at,
             report: Some(report),
+            totals,
             error: None,
         },
-        Ok(None) => AgentStatus {
+        None => AgentStatus {
             agent,
             installed: true,
             running: false,
             activity_at: 0,
             report: None,
+            totals,
             error: None,
         },
-        Err(error) => AgentStatus {
-            agent,
-            installed: true,
-            running: false,
-            activity_at: 0,
-            report: None,
-            error: Some(error.to_string()),
-        },
+    }
+}
+
+fn errored_status(agent: Agent, error: MonitorError) -> AgentStatus {
+    AgentStatus {
+        agent,
+        installed: true,
+        running: false,
+        activity_at: 0,
+        report: None,
+        totals: AgentTotals::default(),
+        error: Some(error.to_string()),
     }
 }
 
@@ -915,6 +1087,29 @@ fn drain_pending(rx: &mpsc::Receiver<Agent>) -> Result<(), MonitorError> {
     }
 }
 
+/// 逐源全量重建总量缓存，每完成一个源就推送一次（渐进出现在 UI）。
+/// `dbs_only` 用于 reconcile 节拍：JSONL 源历史静态、事件路径已增量维护，
+/// 只有 db 源需要周期性全量自愈；完整重建留给启动与显式重扫。
+fn progressive_full_rescan(
+    project: Option<&str>,
+    sources: &[SourceLocation],
+    totals_cache: &mut SessionTotalsCache,
+    cached: &mut [AgentStatus],
+    dbs_only: bool,
+    mut emit: impl FnMut(&[AgentStatus]),
+) {
+    for source in sources {
+        let full = !dbs_only || matches!(source.kind, SourceKind::ZCodeDb | SourceKind::OpenCodeDb);
+        if let Some(slot) = cached
+            .iter_mut()
+            .find(|status| status.agent == source.kind.agent())
+        {
+            *slot = scan_agent_status(project, source, totals_cache, full);
+        }
+        emit(cached);
+    }
+}
+
 /// One engine pass shared by the spawned thread and tests: watches all installed
 /// sources, debounces file events, and re-detects on every reconcile tick.
 pub fn run_engine(
@@ -936,11 +1131,22 @@ pub fn run_engine(
     // contract: notify stops watching when the value is dropped, so reassigning on
     // rebuild is what retires the previous source set.
     let mut watched = create_watchers(&sources, &tx)?;
-    let mut cached = collect_statuses(project.as_deref(), &sources);
+    let mut totals_cache: SessionTotalsCache = HashMap::new();
+    // 先用廉价扫描出首屏（与旧引擎同成本），总量随后逐源全量重建渐进补齐——
+    // Codex 全量解析可达数秒，不能挡在首轮 Statuses 之前
+    let mut cached = collect_statuses(project.as_deref(), &sources, &mut totals_cache, false);
     let mut emit = |cached: &[AgentStatus]| {
         on_event(EngineEvent::Statuses(cached.to_vec()));
     };
     emit(&cached);
+    progressive_full_rescan(
+        project.as_deref(),
+        &sources,
+        &mut totals_cache,
+        &mut cached,
+        false,
+        |cached| emit(cached),
+    );
     let mut next_reconcile = Instant::now() + reconcile;
     let mut dirty: HashSet<Agent> = HashSet::new();
     loop {
@@ -952,8 +1158,16 @@ pub fn run_engine(
         if rescan_requested.is_some_and(|flag| flag.swap(false, Ordering::Relaxed)) {
             sources = detect_all_installed();
             watched = create_watchers(&sources, &tx)?;
-            cached = collect_statuses(project.as_deref(), &sources);
+            cached = collect_statuses(project.as_deref(), &sources, &mut totals_cache, false);
             emit(&cached);
+            progressive_full_rescan(
+                project.as_deref(),
+                &sources,
+                &mut totals_cache,
+                &mut cached,
+                false,
+                |cached| emit(cached),
+            );
             next_reconcile = Instant::now() + reconcile;
         }
         let remaining = next_reconcile.saturating_duration_since(Instant::now());
@@ -982,7 +1196,9 @@ pub fn run_engine(
                     if let Some(source) = sources.iter().find(|source| source.kind.agent() == agent)
                     {
                         if let Some(slot) = cached.iter_mut().find(|status| status.agent == agent) {
-                            *slot = scan_agent_status(project.as_deref(), source);
+                            // 事件路径只增量更新活跃会话；历史由 reconcile 全量重建兜底
+                            *slot =
+                                scan_agent_status(project.as_deref(), source, &mut totals_cache, false);
                         }
                     }
                 }
@@ -993,8 +1209,15 @@ pub fn run_engine(
                     drain_pending(&rx)?;
                     sources = detect_all_installed();
                     watched = create_watchers(&sources, &tx)?;
-                    cached = collect_statuses(project.as_deref(), &sources);
-                    emit(&cached);
+                    // JSONL 源历史静态、事件已增量维护；只全量自愈便宜的 db 源
+                    progressive_full_rescan(
+                        project.as_deref(),
+                        &sources,
+                        &mut totals_cache,
+                        &mut cached,
+                        true,
+                        |cached| emit(cached),
+                    );
                     next_reconcile = Instant::now() + reconcile;
                 }
             }

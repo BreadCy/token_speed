@@ -87,6 +87,7 @@ fn legacy_speed_prefers_model_speed_and_marks_estimates() {
             project: None,
         },
         output_tokens: 100,
+        input_tokens: 0,
         started_at: 0,
         completed_at: 1_000,
         effective_speed: 50.0,

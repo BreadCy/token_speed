@@ -1,0 +1,5 @@
+{"type":"user","sessionId":"sess-cc-1","cwd":"/redacted/claude-project","timestamp":1767225600000,"message":{"role":"user","content":[{"type":"text"}]}}
+{"type":"assistant","sessionId":"sess-cc-1","cwd":"/redacted/claude-project","timestamp":1767225601000,"message":{"id":"msg-cc-1","model":"model-a","usage":{"output_tokens":10,"input_tokens":5,"cache_creation_input_tokens":100,"cache_read_input_tokens":50},"stop_reason":"tool_use"}}
+{"type":"user","sessionId":"sess-cc-1","cwd":"/redacted/claude-project","timestamp":1767225601000,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1"}]}}
+{"type":"assistant","sessionId":"sess-cc-1","cwd":"/redacted/claude-project","timestamp":1767225601000,"message":{"id":"msg-cc-1","model":"model-a","usage":{"output_tokens":10},"stop_reason":"tool_use"}}
+{"type":"assistant","sessionId":"sess-cc-1","cwd":"/redacted/claude-project","timestamp":1767225602500,"message":{"id":"msg-cc-2","model":"model-b","usage":{"output_tokens":20,"input_tokens":7,"cache_creation_input_tokens":200,"cache_read_input_tokens":0},"stop_reason":"end_turn"}}

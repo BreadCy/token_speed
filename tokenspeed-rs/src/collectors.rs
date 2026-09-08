@@ -58,6 +58,10 @@ pub struct TurnMeasurement {
     pub turn_id: String,
     pub session: SessionRef,
     pub output_tokens: u64,
+    /// 模型实际处理的输入（含缓存读+写）；与 output 一样只统计完成轮。
+    /// ZCode/Codex 的 input 字段天然含缓存读，Claude/OpenCode/Pi 需手动加 cache 字段。
+    #[serde(default)]
+    pub input_tokens: u64,
     pub started_at: i64,
     pub completed_at: i64,
     pub effective_speed: f64,
@@ -75,6 +79,9 @@ pub struct Snapshot {
     #[serde(skip)]
     pub(crate) all_turns: Vec<TurnMeasurement>,
     pub session_total_tokens: u64,
+    /// 全部完成轮的输入（含缓存读+写）累计；与 session_total_tokens 同口径互补。
+    #[serde(default)]
+    pub session_total_input_tokens: u64,
     pub session_total_elapsed_ms: i64,
     pub session_accuracy: Accuracy,
     pub activity_at: i64,
@@ -201,6 +208,8 @@ struct CodexInfo {
 #[derive(Deserialize)]
 struct CodexUsage {
     output_tokens: Option<i64>,
+    input_tokens: Option<i64>,
+    cache_write_input_tokens: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -229,6 +238,9 @@ struct ClaudeMessage {
 #[derive(Deserialize)]
 struct ClaudeUsage {
     output_tokens: Option<TokenCount>,
+    input_tokens: Option<TokenCount>,
+    cache_creation_input_tokens: Option<TokenCount>,
+    cache_read_input_tokens: Option<TokenCount>,
 }
 
 #[derive(Deserialize)]
@@ -261,6 +273,14 @@ struct OpenData {
 #[derive(Deserialize)]
 struct OpenTokens {
     output: Option<i64>,
+    input: Option<i64>,
+    cache: Option<OpenCache>,
+}
+
+#[derive(Deserialize)]
+struct OpenCache {
+    read: Option<i64>,
+    write: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -292,6 +312,8 @@ fn snapshots(agent: Agent, turns: Vec<TurnMeasurement>) -> Result<Vec<Snapshot>,
         .map(|(session, mut all_turns)| {
             all_turns.sort_by_key(|turn| std::cmp::Reverse(turn.completed_at));
             let session_total_tokens = all_turns.iter().map(|turn| turn.output_tokens).sum();
+            let session_total_input_tokens =
+                all_turns.iter().map(|turn| turn.input_tokens).sum();
             let session_total_elapsed_ms = all_turns
                 .iter()
                 .map(|turn| turn.completed_at.saturating_sub(turn.started_at).max(0))
@@ -312,6 +334,7 @@ fn snapshots(agent: Agent, turns: Vec<TurnMeasurement>) -> Result<Vec<Snapshot>,
                 turns,
                 all_turns,
                 session_total_tokens,
+                session_total_input_tokens,
                 session_total_elapsed_ms,
                 session_accuracy,
                 activity_at,
@@ -351,6 +374,7 @@ struct ZTurn {
     started_at: i64,
     completed_at: i64,
     output: u64,
+    input: u64,
     generation_ms: i64,
     /// 有 first_token_at 的完成行累计的生成输出（模型速度分子）
     generation_output: u64,
@@ -410,7 +434,8 @@ fn collect_zcode_impl(
     let mut stmt = con
         .prepare(
             "SELECT mu.session_id, mu.turn_id, s.directory, mu.model_id, mu.status,
-                    mu.started_at, mu.first_token_at, mu.completed_at, mu.output_tokens
+                    mu.started_at, mu.first_token_at, mu.completed_at, mu.output_tokens,
+                    mu.input_tokens, mu.cache_creation_input_tokens
              FROM model_usage mu JOIN session s ON s.id = mu.session_id
              WHERE mu.turn_id IS NOT NULL AND mu.started_at IS NOT NULL
              ORDER BY mu.completed_at ASC",
@@ -429,12 +454,18 @@ fn collect_zcode_impl(
                 r.get::<_, Option<i64>>(6)?,
                 r.get::<_, Option<i64>>(7)?,
                 r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, Option<i64>>(10)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (sid, tid, directory, model, status, started, first, completed, output) =
+        let (sid, tid, directory, model, status, started, first, completed, output, input, cache_write) =
             row.map_err(sql_error)?;
+        // input_tokens 已含缓存读（computed_total = input + output 实测验证），
+        // 缓存写是独立的 Anthropic 风格字段，需另加
+        let input = input.unwrap_or(0).max(0) as u64
+            + cache_write.unwrap_or(0).max(0) as u64;
         let entry = grouped
             .entry((sid.clone(), tid.clone()))
             .or_insert_with(|| ZTurn {
@@ -443,6 +474,7 @@ fn collect_zcode_impl(
                 started_at: started,
                 completed_at: completed.unwrap_or(started),
                 output: 0,
+                input: 0,
                 generation_ms: 0,
                 generation_output: 0,
                 completed_rows: 0,
@@ -465,6 +497,7 @@ fn collect_zcode_impl(
         entry.started_at = entry.started_at.min(started);
         entry.completed_at = entry.completed_at.max(completed);
         entry.output = entry.output.saturating_add(output as u64);
+        entry.input = entry.input.saturating_add(input);
         entry.completed_rows += 1;
         entry.models.push(model);
         // 缺 first_token_at 的行无法拆出纯生成时长，不参与模型速度，
@@ -507,6 +540,7 @@ fn collect_zcode_impl(
                 turn_id: t.turn_id,
                 session: t.session,
                 output_tokens: t.output,
+                input_tokens: t.input,
                 started_at: t.started_at,
                 completed_at: t.completed_at,
                 effective_speed: speed(t.output, t.started_at, t.completed_at),
@@ -541,6 +575,7 @@ fn collect_zcode_impl(
                     turns: Vec::new(),
                     all_turns: Vec::new(),
                     session_total_tokens: 0,
+                    session_total_input_tokens: 0,
                     session_total_elapsed_ms: 0,
                     session_accuracy: Accuracy::Unavailable,
                     activity_at,
@@ -563,6 +598,8 @@ struct CodexTurn {
     started_at: i64,
     max_total: u64,
     baseline: u64,
+    input_max: u64,
+    input_baseline: u64,
     model: Option<String>,
     malformed: bool,
 }
@@ -586,6 +623,7 @@ fn collect_codex_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot
     let mut model = None;
     let mut turn_context = None;
     let mut total = 0_u64;
+    let mut input_total = 0_u64;
     let mut active: Option<CodexTurn> = None;
     let mut turns = Vec::new();
     let mut last_activity = 0_i64;
@@ -634,14 +672,15 @@ fn collect_codex_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot
                 }
             }
             Some("token_count") => {
-                let output = p
+                let usage = p
                     .and_then(|payload| {
                         payload
                             .info
                             .as_ref()
                             .and_then(|info| info.total_token_usage.as_ref())
                             .or(payload.total_token_usage.as_ref())
-                    })
+                    });
+                let output = usage
                     .and_then(|usage| usage.output_tokens)
                     .filter(|n| *n >= 0);
                 if let Some(n) = output {
@@ -651,6 +690,15 @@ fn collect_codex_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot
                     }
                 } else if let Some(turn) = active.as_mut() {
                     turn.malformed = true;
+                }
+                // input_tokens 已含 cached_input_tokens；缓存写独立计
+                if let Some(usage) = usage {
+                    let input = usage.input_tokens.unwrap_or(0).max(0) as u64
+                        + usage.cache_write_input_tokens.unwrap_or(0).max(0) as u64;
+                    input_total = input_total.max(input);
+                    if let Some(turn) = active.as_mut() {
+                        turn.input_max = turn.input_max.max(input_total);
+                    }
                 }
             }
             Some("task_started") => {
@@ -685,6 +733,8 @@ fn collect_codex_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot
                     started_at,
                     max_total: total,
                     baseline: total,
+                    input_max: input_total,
+                    input_baseline: input_total,
                     model: model.clone(),
                     malformed: false,
                 });
@@ -713,6 +763,7 @@ fn collect_codex_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot
                     continue;
                 };
                 let output = turn.max_total.saturating_sub(turn.baseline);
+                let input = turn.input_max.saturating_sub(turn.input_baseline);
                 if turn.malformed || output == 0 || completed_at <= turn.started_at {
                     continue;
                 }
@@ -720,6 +771,7 @@ fn collect_codex_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot
                     turn_id: turn.id,
                     session: turn.session,
                     output_tokens: output,
+                    input_tokens: input,
                     started_at: turn.started_at,
                     completed_at,
                     effective_speed: speed(output, turn.started_at, completed_at),
@@ -752,6 +804,7 @@ fn collect_codex_impl(path: &Path, include_running: bool) -> Result<Vec<Snapshot
                     turns: Vec::new(),
                     all_turns: Vec::new(),
                     session_total_tokens: 0,
+                    session_total_input_tokens: 0,
                     session_total_elapsed_ms: 0,
                     session_accuracy: Accuracy::Unavailable,
                     activity_at: last_activity.max(started_at),
@@ -773,6 +826,7 @@ struct OpenTurn {
     started_at: i64,
     completed_at: i64,
     output: u64,
+    input: u64,
     models: Vec<Option<String>>,
     malformed: bool,
 }
@@ -783,6 +837,7 @@ struct ClaudeTurn {
     started_at: i64,
     completed_at: i64,
     output: u64,
+    input: u64,
     models: Vec<Option<String>>,
     malformed: bool,
 }
@@ -865,6 +920,17 @@ fn collect_opencode_impl(
             .and_then(|time| time.completed)
             .unwrap_or(db_updated);
         let output = v.tokens.as_ref().and_then(|tokens| tokens.output);
+        let input = v
+            .tokens
+            .as_ref()
+            .map(|tokens| {
+                tokens.input.unwrap_or(0).max(0) as u64
+                    + tokens.cache.as_ref().map_or(0, |cache| {
+                        cache.read.unwrap_or(0).max(0) as u64
+                            + cache.write.unwrap_or(0).max(0) as u64
+                    })
+            })
+            .unwrap_or(0);
         let complete_metadata = output.is_some_and(|value| value >= 0)
             && v.time.as_ref().and_then(|time| time.completed).is_some();
         if !complete_metadata {
@@ -890,6 +956,7 @@ fn collect_opencode_impl(
             started_at,
             completed_at: completed,
             output: 0,
+            input: 0,
             models: Vec::new(),
             malformed: malformed_sessions.contains(&sid),
         });
@@ -898,6 +965,7 @@ fn collect_opencode_impl(
         entry.output = entry
             .output
             .saturating_add(output.unwrap_or(0).max(0) as u64);
+        entry.input = entry.input.saturating_add(input);
         entry.models.push(
             v.model_id
                 .clone()
@@ -914,6 +982,7 @@ fn collect_opencode_impl(
                         turn_id: done.id,
                         session: done.session,
                         output_tokens: done.output,
+                        input_tokens: done.input,
                         started_at: done.started_at,
                         completed_at: done.completed_at,
                         effective_speed: speed(done.output, done.started_at, done.completed_at),
@@ -947,6 +1016,7 @@ fn collect_opencode_impl(
                     turns: Vec::new(),
                     all_turns: Vec::new(),
                     session_total_tokens: 0,
+                    session_total_input_tokens: 0,
                     session_total_elapsed_ms: 0,
                     session_accuracy: Accuracy::Unavailable,
                     activity_at,
@@ -1085,6 +1155,7 @@ fn collect_claude_paths(
                         started_at: ts,
                         completed_at: ts,
                         output: 0,
+                        input: 0,
                         models: Vec::new(),
                         malformed: false,
                     },
@@ -1123,6 +1194,21 @@ fn collect_claude_paths(
             None => 0,
         };
         entry.output = entry.output.saturating_add(output);
+        // Anthropic 风格：input_tokens 不含缓存，读+写都要另加
+        let input = message
+            .usage
+            .as_ref()
+            .map(|usage| {
+                [usage.input_tokens.as_ref(), usage.cache_creation_input_tokens.as_ref(), usage.cache_read_input_tokens.as_ref()]
+                    .into_iter()
+                    .map(|field| match field {
+                        Some(TokenCount::Valid(value)) => (*value).max(0) as u64,
+                        _ => 0,
+                    })
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+        entry.input = entry.input.saturating_add(input);
         entry.models.push(message.model.clone());
         if message.stop_reason.as_deref() == Some("end_turn") {
             if let Some(done) = active.remove(&sid) {
@@ -1131,6 +1217,7 @@ fn collect_claude_paths(
                         turn_id: done.id,
                         session: done.session,
                         output_tokens: done.output,
+                        input_tokens: done.input,
                         started_at: done.started_at,
                         completed_at: done.completed_at,
                         effective_speed: speed(done.output, done.started_at, done.completed_at),
@@ -1170,6 +1257,7 @@ fn collect_claude_paths(
                     turns: Vec::new(),
                     all_turns: Vec::new(),
                     session_total_tokens: 0,
+                    session_total_input_tokens: 0,
                     session_total_elapsed_ms: 0,
                     session_accuracy: Accuracy::Unavailable,
                     activity_at,
@@ -1211,6 +1299,11 @@ struct PiMessage {
 #[derive(Deserialize)]
 struct PiUsage {
     output: Option<i64>,
+    input: Option<i64>,
+    #[serde(rename = "cacheRead")]
+    cache_read: Option<i64>,
+    #[serde(rename = "cacheWrite")]
+    cache_write: Option<i64>,
 }
 
 struct PiTurn {
@@ -1218,6 +1311,7 @@ struct PiTurn {
     started_at: i64,
     completed_at: i64,
     output: u64,
+    input: u64,
     models: Vec<Option<String>>,
     malformed: bool,
 }
@@ -1321,6 +1415,7 @@ fn collect_pi_paths(
                             started_at,
                             completed_at: envelope_ts.unwrap_or(started_at),
                             output: 0,
+                            input: 0,
                             models: Vec::new(),
                             malformed: false,
                         },
@@ -1339,6 +1434,17 @@ fn collect_pi_paths(
                         .and_then(|usage| usage.output)
                         .unwrap_or(0);
                     turn.output = turn.output.saturating_add(output.max(0) as u64);
+                    turn.input = turn.input.saturating_add(
+                        message
+                            .usage
+                            .as_ref()
+                            .map(|usage| {
+                                usage.input.unwrap_or(0).max(0) as u64
+                                    + usage.cache_read.unwrap_or(0).max(0) as u64
+                                    + usage.cache_write.unwrap_or(0).max(0) as u64
+                            })
+                            .unwrap_or(0),
+                    );
                     turn.models.push(message.model.clone());
                     if message.stop_reason.as_deref() == Some("stop") {
                         if let Some(done) = active.remove(&sid) {
@@ -1350,6 +1456,7 @@ fn collect_pi_paths(
                                     turn_id: format!("{}:{}", done.session.id, done.started_at),
                                     session: done.session,
                                     output_tokens: done.output,
+                                    input_tokens: done.input,
                                     started_at: done.started_at,
                                     completed_at: done.completed_at,
                                     effective_speed: speed(
@@ -1404,6 +1511,7 @@ fn collect_pi_paths(
                     turns: Vec::new(),
                     all_turns: Vec::new(),
                     session_total_tokens: 0,
+                    session_total_input_tokens: 0,
                     session_total_elapsed_ms: 0,
                     session_accuracy: Accuracy::Unavailable,
                     activity_at,

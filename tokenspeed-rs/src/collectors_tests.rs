@@ -45,6 +45,8 @@ fn zcode_joins_project_and_aggregates_completed_turn() {
         .unwrap();
     assert_eq!(turn.turn_id, "turn-z-1");
     assert_eq!(turn.output_tokens, 100);
+    // ZCode input_tokens 已含缓存读，另加 cache_creation（fixture 中写列）
+    assert_eq!(turn.input_tokens, 1700);
     assert_eq!(turn.started_at, 1_000);
     assert_eq!(turn.completed_at, 3_000);
     assert_eq!(turn.accuracy, Accuracy::Estimated);
@@ -98,6 +100,8 @@ fn codex_requires_task_boundaries_and_deduplicates_cumulative_usage() {
     let turn = &snapshot.turns[0];
     assert_eq!(turn.turn_id, "turn-cx-1");
     assert_eq!(turn.output_tokens, 25);
+    // input_tokens 已含 cached，加 cache_write；按 cumulative max − baseline 取差值
+    assert_eq!(turn.input_tokens, 2050);
     assert_eq!(turn.started_at, 100_000);
     assert_eq!(turn.completed_at, 300_000);
     assert_eq!(turn.accuracy, Accuracy::Estimated);
@@ -177,6 +181,8 @@ fn opencode_uses_session_id_and_closes_at_stop() {
     assert_eq!(snapshot.turns.len(), 1);
     let turn = &snapshot.turns[0];
     assert_eq!(turn.output_tokens, 50);
+    // OpenCode input 不含缓存：10+10 + cache.read 400 + cache.write 50
+    assert_eq!(turn.input_tokens, 470);
     assert_eq!(turn.started_at, 500);
     assert_eq!(turn.completed_at, 3_000);
     assert_eq!(turn.accuracy, Accuracy::Estimated);
@@ -343,14 +349,15 @@ fn snapshots_keep_only_the_latest_ten_turns_in_descending_completion_order() {
          CREATE TABLE model_usage (
              session_id TEXT, turn_id TEXT, model_id TEXT, status TEXT,
              started_at INTEGER, first_token_at INTEGER, completed_at INTEGER,
-             output_tokens INTEGER
+             output_tokens INTEGER, input_tokens INTEGER,
+             cache_creation_input_tokens INTEGER
          );
          INSERT INTO session VALUES ('session', '/project');",
     )
     .unwrap();
     for n in 1..=12 {
         con.execute(
-            "INSERT INTO model_usage VALUES (?1, ?2, 'model', 'completed', ?3, ?4, ?5, 1)",
+            "INSERT INTO model_usage VALUES (?1, ?2, 'model', 'completed', ?3, ?4, ?5, 1, 0, 0)",
             params![
                 "session",
                 format!("turn-{n}"),
@@ -410,6 +417,8 @@ fn claude_closes_from_real_user_and_deduplicates_assistant_ids() {
     assert_eq!(snapshot.turns.len(), 1);
     let turn = &snapshot.turns[0];
     assert_eq!(turn.output_tokens, 30);
+    // Anthropic 风格：input_tokens 不含缓存，须加 cache_creation/read
+    assert_eq!(turn.input_tokens, 362);
     assert_eq!(turn.started_at, 1_767_225_600_000);
     assert_eq!(turn.completed_at, 1_767_225_602_500);
     assert_eq!(turn.accuracy, Accuracy::Estimated);
@@ -574,6 +583,8 @@ fn pi_aggregates_completed_turn_and_skips_error_rows() {
     assert_eq!(turn.model.as_deref(), Some("muse-spark-1.2"));
     assert_eq!(turn.model_accuracy, Accuracy::Unavailable);
     assert_eq!(snapshot.session_total_tokens, 100);
+    // error 行不 poison：其输入计入该轮；cacheRead/Write 并入输入
+    assert_eq!(snapshot.session_total_input_tokens, 1125);
     assert!(!snapshot.running);
 }
 

@@ -1,0 +1,7 @@
+{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sess-cx-1","cwd":"/redacted/codex-project","model":"gpt-redacted"}}
+{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"turn_id":"turn-cx-1","model":"gpt-redacted"}}
+{"timestamp":"2026-01-01T00:01:40Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-cx-1","started_at":100}}
+{"timestamp":"2026-01-01T00:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":10,"input_tokens":1000,"cache_write_input_tokens":50}}}}
+{"timestamp":"2026-01-01T00:02:20Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":25,"input_tokens":2000,"cache_write_input_tokens":50}}}}
+{"timestamp":"2026-01-01T00:02:25Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"output_tokens":25,"input_tokens":2000,"cache_write_input_tokens":50}}}}
+{"timestamp":"2026-01-01T00:03:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-cx-1","started_at":100,"completed_at":300}}
